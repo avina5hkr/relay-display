@@ -11,6 +11,9 @@ import com.avinash.relaydisplay.protocol.MirrorStop
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -66,6 +69,22 @@ class MirrorController(
 
     private var encoder: ScreenEncoder? = null
     private val droppedFrames = AtomicLong(0)
+
+    /**
+     * Watches the session that capture was started against.
+     *
+     * The invariant: **there is never an active capture without the exact authenticated session
+     * that started it.** Capture used to read `engine.activeSession.value` once and hold that
+     * reference forever, so when the session died the encoder kept running, the MediaProjection
+     * stayed held and Android's recording indicator stayed lit -- for a viewer that was gone.
+     * Observed on hardware: session ended 03:28:10, and at 03:31:56 the phone was still capturing
+     * and had discarded 11,520 frames for nobody.
+     *
+     * A reconnect deliberately does **not** rebind capture to the new session. Resuming silently
+     * would mean the user's screen starts flowing to a session they never granted consent for.
+     * Stopping and asking again is the safe choice.
+     */
+    private var sessionWatch: Job? = null
 
     @Volatile
     private var onStoppedCallback: (() -> Unit)? = null
@@ -135,10 +154,26 @@ class MirrorController(
         if (!started) {
             newEncoder.close()
             onStoppedCallback = null
+            sessionWatch?.cancel()
+            sessionWatch = null
             return@withLock false
         }
 
         encoder = newEncoder
+
+        // From here on, capture is bound to this exact session object. Identity, not equality:
+        // a reconnect produces a different RelaySession and must stop the old capture.
+        sessionWatch = scope.launch {
+            engine.activeSession.collect { current ->
+                if (current !== session) {
+                    diagnostics.warn("mirror", "session ended or changed; stopping capture")
+                    // NonCancellable because stopLocked cancels this very job; without it the
+                    // teardown would abort partway and leave the projection held.
+                    withContext(NonCancellable) { stop("session ended") }
+                }
+            }
+        }
+
         val effective = newEncoder.profile ?: profile
         session.trySend(
             MirrorStart(
@@ -176,6 +211,8 @@ class MirrorController(
             return
         }
         encoder = null
+        sessionWatch?.cancel()
+        sessionWatch = null
         current.close()
         engine.activeSession.value?.trySend(MirrorStop(UUID.randomUUID(), reason.take(64)))
         releaseDecoder()

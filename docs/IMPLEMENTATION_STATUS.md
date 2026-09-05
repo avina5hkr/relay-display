@@ -136,7 +136,7 @@ during this work.**
 | Defect | State |
 | --- | --- |
 | **A. Control starvation** — one 8-slot queue shared by video, heartbeat and all control; heartbeat closed the session on a full queue | **Fixed.** Split into CONTROL/BULK/MEDIA with a strict-priority writer. Covered by `OutboundPriorityTest` and two `LoopbackSessionTest` cases over a real encrypted session. **A real latent defect, but hardware testing showed it is _not_ the cause of the reported one-minute failure** — see `docs/TESTING.md`. |
-| **B. Capture surviving session termination** | **Not done, and confirmed on hardware as the actual cause of the reported failure.** Session ended 03:28:10; at 03:31:56 the Controller still held MediaProjection, still ran the encoder and had dropped 11,520 frames for a peer that was gone. Highest priority. |
+| **B. Capture surviving session termination** | **Fixed and hardware-verified.** Capture is now bound to the exact `RelaySession` that started it and stops the moment that session ends or is replaced. Measured on device: killing the Display process stopped capture in **1 s** (previously still running after 4 minutes), with `dumpsys media_projection` reporting `null`, the foreground service gone and the indicator cleared. A reconnect deliberately does **not** rebind capture — resuming silently would stream the user's screen to a session they never consented to. |
 | **C. Reliable mirror negotiation** | **Partly.** MirrorStart/Config/Stop are now CONTROL class, so they are no longer dropped under video pressure. There is still no mirrorId/epoch, no ACK and no MirrorReady handshake. |
 | **D. Decoder failures not reported to the Controller** | **Not done.** |
 | **E. Surface lifecycle modelling** | **Not done.** |
