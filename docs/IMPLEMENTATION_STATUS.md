@@ -135,8 +135,8 @@ during this work.**
 
 | Defect | State |
 | --- | --- |
-| **A. Control starvation** — one 8-slot queue shared by video, heartbeat and all control; heartbeat closed the session on a full queue | **Fixed.** Split into CONTROL/BULK/MEDIA with a strict-priority writer. Covered by `OutboundPriorityTest` and two `LoopbackSessionTest` cases over a real encrypted session. |
-| **B. Capture surviving session termination** | **Not done.** `MirrorController` still captures `engine.activeSession.value` once at start. |
+| **A. Control starvation** — one 8-slot queue shared by video, heartbeat and all control; heartbeat closed the session on a full queue | **Fixed.** Split into CONTROL/BULK/MEDIA with a strict-priority writer. Covered by `OutboundPriorityTest` and two `LoopbackSessionTest` cases over a real encrypted session. **A real latent defect, but hardware testing showed it is _not_ the cause of the reported one-minute failure** — see `docs/TESTING.md`. |
+| **B. Capture surviving session termination** | **Not done, and confirmed on hardware as the actual cause of the reported failure.** Session ended 03:28:10; at 03:31:56 the Controller still held MediaProjection, still ran the encoder and had dropped 11,520 frames for a peer that was gone. Highest priority. |
 | **C. Reliable mirror negotiation** | **Partly.** MirrorStart/Config/Stop are now CONTROL class, so they are no longer dropped under video pressure. There is still no mirrorId/epoch, no ACK and no MirrorReady handshake. |
 | **D. Decoder failures not reported to the Controller** | **Not done.** |
 | **E. Surface lifecycle modelling** | **Not done.** |
