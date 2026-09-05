@@ -5,6 +5,8 @@ import android.view.Surface
 import com.avinash.relaydisplay.diagnostics.DiagnosticsLog
 import com.avinash.relaydisplay.network.session.SessionHost
 import com.avinash.relaydisplay.protocol.MirrorConfig
+import com.avinash.relaydisplay.protocol.MessageCodec
+import com.avinash.relaydisplay.network.session.RelaySession
 import com.avinash.relaydisplay.protocol.MirrorFrame
 import com.avinash.relaydisplay.protocol.MirrorStart
 import com.avinash.relaydisplay.protocol.MirrorStop
@@ -126,9 +128,7 @@ class MirrorController(
             }
 
             override fun onFrame(frame: EncodedFrame) {
-                val accepted = session.trySend(
-                    MirrorFrame(UUID.randomUUID(), frame.presentationTimeUs, frame.keyFrame, frame.data),
-                )
+                val accepted = sendFragmented(session, frame)
                 if (!accepted) {
                     // The link is the bottleneck. Dropping here is the whole strategy.
                     val total = droppedFrames.incrementAndGet()
@@ -280,14 +280,114 @@ class MirrorController(
         }
     }
 
+    private var assemblySequence: Long = -1
+    private var assembly: Array<ByteArray?>? = null
+    private var assemblyBytes: Int = 0
+
+    /**
+     * Reassembles a frame from its fragments before handing it to the decoder.
+     *
+     * Only one frame is ever in flight: a fragment for a newer frame abandons whatever was
+     * partially assembled, because a late fragment of a superseded frame is worth nothing and
+     * holding several partial frames is unbounded memory for no benefit. An incomplete frame is
+     * simply never submitted.
+     */
     fun onMirrorFrame(frame: MirrorFrame) {
-        decoder?.submit(frame.data, frame.presentationTimeUs, frame.keyFrame)
+        if (frame.fragmentCount <= 1) {
+            assembly = null
+            decoder?.submit(frame.data, frame.presentationTimeUs, frame.keyFrame)
+            return
+        }
+        if (frame.fragmentCount > MessageCodec.MAX_MIRROR_FRAGMENTS ||
+            frame.fragmentIndex !in 0 until frame.fragmentCount
+        ) {
+            diagnostics.warn("mirror", "discarding a fragment with an implausible index or count")
+            assembly = null
+            return
+        }
+
+        if (frame.frameSequence != assemblySequence) {
+            assemblySequence = frame.frameSequence
+            assembly = arrayOfNulls(frame.fragmentCount)
+            assemblyBytes = 0
+        }
+        val parts = assembly ?: return
+        if (parts.size != frame.fragmentCount) {
+            assembly = null
+            return
+        }
+        if (parts[frame.fragmentIndex] == null) {
+            parts[frame.fragmentIndex] = frame.data
+            assemblyBytes += frame.data.size
+        }
+        if (parts.any { it == null }) return
+
+        val whole = ByteArray(assemblyBytes)
+        var at = 0
+        for (part in parts) {
+            part!!.copyInto(whole, at)
+            at += part.size
+        }
+        assembly = null
+        decoder?.submit(whole, frame.presentationTimeUs, frame.keyFrame)
     }
 
     fun onMirrorStopped() {
         releaseDecoder()
         pendingConfig = null
         _state.value = MirrorState.Idle
+    }
+
+    private val frameSequence = AtomicLong(0)
+
+    /**
+     * Splits one encoded frame across as many records as it needs.
+     *
+     * A full-screen keyframe -- the thing an app switch produces -- is routinely larger than the
+     * protocol's per-field cap. Sending it whole made the receiver reject the record with
+     * PAYLOAD_TOO_LARGE and drop the entire session, which is the "mirror dies when I open another
+     * app" failure.
+     *
+     * A frame too large even to fragment is dropped rather than sent, because no single frame is
+     * worth a session. Returns false only when a fragment could not be queued, which the caller
+     * counts as a dropped frame exactly as before.
+     */
+    private fun sendFragmented(session: RelaySession, frame: EncodedFrame): Boolean {
+        val limit = MessageCodec.MAX_MIRROR_FRAGMENT_BYTES
+        val total = frame.data.size
+        val count = (total + limit - 1) / limit
+
+        if (count > MessageCodec.MAX_MIRROR_FRAGMENTS) {
+            // Bounded by construction: a frame this large is a codec anomaly, not something to
+            // buffer. Drop it and ask for a fresh keyframe so the display can resynchronise.
+            diagnostics.warn("mirror", "frame of ${total}B exceeds the fragment budget; dropped")
+            encoder?.requestKeyFrame()
+            return false
+        }
+        if (count <= 1) {
+            return session.trySend(
+                MirrorFrame(
+                    UUID.randomUUID(), frame.presentationTimeUs, frame.keyFrame, frame.data,
+                    frameSequence = frameSequence.incrementAndGet(), fragmentIndex = 0, fragmentCount = 1,
+                ),
+            )
+        }
+
+        val sequence = frameSequence.incrementAndGet()
+        for (index in 0 until count) {
+            val from = index * limit
+            val slice = frame.data.copyOfRange(from, minOf(from + limit, total))
+            val queued = session.trySend(
+                MirrorFrame(
+                    UUID.randomUUID(), frame.presentationTimeUs, frame.keyFrame, slice,
+                    frameSequence = sequence, fragmentIndex = index, fragmentCount = count,
+                ),
+            )
+            // A partial frame is useless, so stop as soon as one fragment cannot be queued rather
+            // than filling the queue with fragments the receiver will discard anyway.
+            if (!queued) return false
+        }
+        return true
     }
 
     private fun requestKeyFrameFromPeer() {
