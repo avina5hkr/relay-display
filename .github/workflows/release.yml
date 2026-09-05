@@ -1,0 +1,403 @@
+name: Release
+
+# Signed release builds. This is the only workflow with access to the signing key, and it reaches
+# it only through the protected `release` environment.
+#
+# Design notes that matter:
+#   * The tag is the trigger, but never the source of truth. The version lives in
+#     gradle.properties and the tag must equal v${APP_VERSION_NAME}; a mismatch fails the build
+#     rather than silently publishing something mislabelled.
+#   * Every gate runs BEFORE the key is decoded, so a bad tag never touches signing material.
+#   * Passwords travel as environment variables, never as command-line arguments, because process
+#     arguments are visible to other processes and are echoed by many tools on failure.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build, sign and verify without publishing anything.'
+        type: boolean
+        default: true
+        required: true
+
+# Read-only at the top level. contents: write is granted to the publishing job alone.
+permissions:
+  contents: read
+
+# One release per version at a time. cancel-in-progress is deliberately false: interrupting a
+# half-finished publish is worse than waiting for it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------------------------
+  # Gate 1: everything that can be checked without the signing key.
+  # -------------------------------------------------------------------------------------------
+  validate:
+    name: Validate tag, version and ancestry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version_name: ${{ steps.meta.outputs.version_name }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.mode.outputs.publish }}
+
+    steps:
+      - name: Check out the exact triggering commit
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history and tags: ancestry cannot be verified from a shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide publish vs dry run
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            # A pushed tag publishes automatically once every gate below passes.
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$DRY" = "false" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK
+        # actions/setup-java v6.0.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        # gradle/actions v6.3.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          validate-wrappers: true
+          cache-read-only: true
+
+      - name: Read version metadata from source
+        id: meta
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --quiet printReleaseMetadata > meta.txt
+          VERSION_NAME="$(grep '^APP_VERSION_NAME=' meta.txt | cut -d= -f2-)"
+          VERSION_CODE="$(grep '^APP_VERSION_CODE=' meta.txt | cut -d= -f2-)"
+          IS_PRERELEASE="$(grep '^IS_PRERELEASE=' meta.txt | cut -d= -f2-)"
+          TAG="v${VERSION_NAME}"
+          {
+            echo "version_name=${VERSION_NAME}"
+            echo "version_code=${VERSION_CODE}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source declares ${VERSION_NAME} (code ${VERSION_CODE}); expected tag ${TAG}"
+
+      - name: Tag must match the source version
+        if: github.event_name == 'push'
+        env:
+          PUSHED_REF: ${{ github.ref_name }}
+          EXPECTED: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$PUSHED_REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'; then
+            echo "::error::Tag '$PUSHED_REF' is not a valid version tag."
+            exit 1
+          fi
+          if [ "$PUSHED_REF" != "$EXPECTED" ]; then
+            echo "::error::Tag '$PUSHED_REF' does not match the source version. Expected '$EXPECTED' from gradle.properties."
+            exit 1
+          fi
+
+      - name: Release commit must be on main
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
+            echo "::error::This tag does not point at a commit contained in origin/main. Releases are cut from main only."
+            exit 1
+          fi
+
+      - name: A release must not already exist for this tag
+        if: steps.mode.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::A GitHub Release already exists for $TAG. Releases are never overwritten."
+            exit 1
+          fi
+          echo "No existing release for $TAG."
+
+  # -------------------------------------------------------------------------------------------
+  # Gate 2: build, sign, verify. Uses the protected environment, so approval (if configured)
+  # happens before the key is ever decoded.
+  # -------------------------------------------------------------------------------------------
+  build:
+    name: Build, sign and verify
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the exact triggering commit
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK
+        # actions/setup-java v6.0.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        # gradle/actions v6.3.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          validate-wrappers: true
+          cache-read-only: true
+
+      - name: Required secrets and variables must be present
+        # Checked before anything is decoded, and reported by NAME only. A missing secret is a
+        # configuration mistake, not something to discover halfway through a signing task.
+        env:
+          KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "${KEY_B64:-}" ]     || MISSING="$MISSING ANDROID_SIGNING_KEY_BASE64"
+          [ -n "${STORE_PASS:-}" ]  || MISSING="$MISSING ANDROID_KEYSTORE_PASSWORD"
+          [ -n "${KEY_ALIAS:-}" ]   || MISSING="$MISSING ANDROID_KEY_ALIAS"
+          [ -n "${KEY_PASS:-}" ]    || MISSING="$MISSING ANDROID_KEY_PASSWORD"
+          [ -n "${CERT_SHA256:-}" ] || MISSING="$MISSING ANDROID_SIGNING_CERT_SHA256"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required release configuration:$MISSING (set them on the 'release' environment)"
+            exit 1
+          fi
+          echo "All required release configuration is present."
+
+      - name: Decode the signing key
+        id: keystore
+        env:
+          KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/release-signing.jks"
+          # umask first so the file is never briefly world-readable between creation and chmod.
+          ( umask 077; printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE" )
+          chmod 600 "$KEYSTORE"
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "::error::Decoded keystore is empty. Check that the secret is single-line Base64."
+            exit 1
+          fi
+          # The path is not a credential, but it is masked anyway so no log line can be used to
+          # correlate runner temp layout.
+          echo "::add-mask::$KEYSTORE"
+          echo "path=$KEYSTORE" >> "$GITHUB_OUTPUT"
+
+      - name: Release gates and signed build
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Passwords are in the environment, never on the command line.
+          ./gradlew --no-daemon --stacktrace \
+            validateVersion \
+            testDebugUnitTest \
+            lintRelease \
+            assembleDebugAndroidTest \
+            assembleRelease \
+            bundleRelease
+
+      - name: Verify the signed artifacts
+        env:
+          EXPECTED_FINGERPRINT: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          APK=app/build/outputs/apk/release/app-release.apk
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          MAPPING=app/build/outputs/mapping/release/mapping.txt
+
+          # --- existence -----------------------------------------------------------------
+          for f in "$APK" "$AAB" "$MAPPING"; do
+            [ -s "$f" ] || { echo "::error::Missing or empty: $f"; exit 1; }
+          done
+
+          # --- APK signature -------------------------------------------------------------
+          # Gradle reporting success is not evidence the APK is correctly signed; verify it.
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK" > apksigner.txt
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" apksigner.txt \
+            || { echo "::error::APK is not v2-signed."; exit 1; }
+
+          ACTUAL_FP="$(grep -m1 'Signer #1 certificate SHA-256 digest:' apksigner.txt | awk '{print $NF}' | tr 'A-Z' 'a-z')"
+          EXPECTED_FP="$(printf '%s' "$EXPECTED_FINGERPRINT" | tr -d ': \n' | tr 'A-Z' 'a-z')"
+          if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then
+            # Fingerprints are public certificate data, not secrets, so printing them is safe and
+            # is the only way to make a mismatch diagnosable.
+            echo "::error::Signing certificate mismatch. Expected $EXPECTED_FP, got $ACTUAL_FP."
+            exit 1
+          fi
+
+          # --- APK identity and version --------------------------------------------------
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK")"
+          echo "$BADGING" | grep -q "package: name='com.avinash.relaydisplay'" \
+            || { echo "::error::Unexpected applicationId."; exit 1; }
+          echo "$BADGING" | grep -q "versionCode='${EXPECTED_VERSION_CODE}'" \
+            || { echo "::error::APK versionCode does not match source."; exit 1; }
+          echo "$BADGING" | grep -q "versionName='${EXPECTED_VERSION_NAME}'" \
+            || { echo "::error::APK versionName does not match source."; exit 1; }
+
+          # --- AAB signature -------------------------------------------------------------
+          jarsigner -verify "$AAB" | grep -q "jar verified" \
+            || { echo "::error::AAB signature did not verify."; exit 1; }
+
+          echo "APK and AAB verified against the expected certificate and version."
+
+      - name: Stage named artifacts and checksums
+        env:
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          OUT=dist
+          mkdir -p "$OUT"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT/RelayDisplay-${VERSION_NAME}.apk"
+          cp app/build/outputs/bundle/release/app-release.aab "$OUT/RelayDisplay-${VERSION_NAME}.aab"
+          cp app/build/outputs/mapping/release/mapping.txt "$OUT/RelayDisplay-${VERSION_NAME}-mapping.txt"
+          ( cd "$OUT" && sha256sum ./* > SHA256SUMS )
+          cat "$OUT/SHA256SUMS"
+
+      - name: Remove the decoded key
+        # always(): the key must not survive a failed build either.
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/release-signing.jks" || true
+          echo "Decoded keystore removed."
+
+      - name: Dry-run notice
+        if: needs.validate.outputs.publish != 'true'
+        run: >-
+          echo "Dry run complete. Artifacts were built, signed and verified;
+          no tag and no GitHub Release were created."
+
+      - name: Upload artifacts for the publish job
+        # actions/upload-artifact v7.0.1 -- dist/ only. The keystore lives in RUNNER_TEMP and is
+        # never inside the workspace, so it cannot be swept into an upload.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-artifacts
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------------------------
+  # Gate 3: publish. The only job with contents: write.
+  # -------------------------------------------------------------------------------------------
+  publish:
+    name: Create the GitHub Release
+    needs: [validate, build]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download artifacts
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Re-verify checksums before publishing
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum -c SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE=notes.md
+          {
+            echo "## Relay Display ${VERSION_NAME}"
+            echo
+            echo "### Install"
+            echo
+            echo "Download **RelayDisplay-${VERSION_NAME}.apk** and install it on both phones."
+            echo "The \`.aab\` is a Play Console upload format and **cannot be installed directly**."
+            echo
+            echo "Verify your download before installing:"
+            echo
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo
+            echo "### Notes"
+          } > "$NOTES_FILE"
+
+          PRERELEASE_FLAG=""
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            # A prerelease must never be marked latest, or users following the "latest" link get
+            # a beta without asking for one.
+            PRERELEASE_FLAG="--prerelease --latest=false"
+          fi
+
+          # gh, not a third-party release action: fewer moving parts with write access.
+          # --generate-notes appends GitHub's commit-derived notes after the text above.
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Relay Display ${VERSION_NAME}" \
+            --notes-file "$NOTES_FILE" \
+            --generate-notes \
+            --verify-tag \
+            $PRERELEASE_FLAG \
+            dist/RelayDisplay-${VERSION_NAME}.apk \
+            dist/RelayDisplay-${VERSION_NAME}.aab \
+            dist/RelayDisplay-${VERSION_NAME}-mapping.txt \
+            dist/SHA256SUMS
