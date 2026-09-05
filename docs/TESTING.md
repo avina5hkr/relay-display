@@ -430,6 +430,31 @@ The controller phone has a two-minute screen timeout, a secure lock and no charg
 between steps and `ActivityScenario`-free adb driving stops with it. The remaining rows need it
 unlocked and awake.
 
+### Phase 1 / Phase 2A verification (single device)
+
+Run on the S22 Ultra (Android 16 / API 36) over wireless debugging. **The Lenovo was off-network,
+so nothing two-device was run** -- no mirroring soak, no matrix.
+
+| Check | Result |
+| --- | --- |
+| `testDebugUnitTest` | 339 tests, 0 failures (was 331) |
+| `lintDebug` | 0 errors |
+| `assembleDebug` / `assembleRelease` | both succeed |
+| `connectedDebugAndroidTest` on S22 | **31 tests, 0 failures** -- read from the result XML, not the BUILD line |
+| App licence screen renders the GPL notice | pass -- copyright, grant, warranty disclaimer and where to get a copy all present |
+| Source link opens the repository | pass -- tapping it left RelayDisplay and opened `avina5hkr / relay-display` |
+| Legal asset survives R8 | pass -- `assets/third_party_licenses.txt`, 25,267 bytes, readable from the release APK |
+| `META-INF/LICENSE.txt` now packaged | pass -- 12,484 bytes, previously excluded |
+
+The instrumentation suite passing after the queue split is a regression check, not a mirroring
+test: none of those 31 tests exercise a live session between two phones.
+
+### Still not verified on hardware
+
+The one-minute mirror failure was diagnosed from code and fixed, and the fix is covered by tests
+over a real encrypted loopback session. It has **not** been reproduced or confirmed fixed on the
+phones, because that needs the Companion Display attached at the same time as the Controller.
+
 ### Visual defects found by reading screenshots
 
 Three rounds now, the same method has found things no assertion did. Screenshots are taken with
