@@ -1,0 +1,50 @@
+# Shared formatting rules for RelayDisplay.
+#
+# These live here rather than in .idea/codeStyles so they apply to every editor and to any
+# command-line formatter, and so the repository does not have to track IDE state to keep
+# formatting consistent. The previous .idea/codeStyles/Project.xml carried exactly two
+# non-default settings -- the Kotlin official style and a 4-space continuation indent -- both of
+# which are expressed below.
+#
+# See https://editorconfig.org. JetBrains IDEs, VS Code and ktlint all honour this file.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{kt,kts}]
+# Kotlin official style, as the IDE settings specified.
+ij_kotlin_code_style_defaults = KOTLIN_OFFICIAL
+ij_continuation_indent_size = 4
+# The codebase wraps at 110; a hard 100 would reflow a lot of deliberately laid-out code.
+max_line_length = 110
+ij_kotlin_allow_trailing_comma = true
+ij_kotlin_allow_trailing_comma_on_call_site = true
+ij_kotlin_name_count_to_use_star_import = 2147483647
+ij_kotlin_name_count_to_use_star_import_for_members = 2147483647
+
+[*.{xml,svg}]
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown, so trimming them changes rendering.
+trim_trailing_whitespace = false
+
+[gradlew.bat]
+# A Windows batch file; CRLF is required and must survive checkout on every platform.
+end_of_line = crlf
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[Makefile]
+indent_style = tab

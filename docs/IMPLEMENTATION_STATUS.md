@@ -118,7 +118,8 @@ Last updated after the Milestone 8 build.
 | Repeated role-change tap is safe | Complete | `Mutex.tryLock`; `a repeated tap while switching is dropped, not queued` |
 | One consistent phrase for closing | Complete | `CLOSE_ON_DISPLAY` = "Close on display" |
 | About & Legal accurate and redesigned | Complete | four tabs; notices generated from resolved POMs |
-| Notices survive R8 | Complete | `assets/third_party_licenses.txt` present in the release APK |
+| Notices survive R8 | Complete | `assets/third_party_licenses.txt` present in the release APK; verified by unzipping the R8 output |
+| Third-party notice completeness | **Not complete** | The generated asset carries POM licence *names and URLs*, not full licence texts or `NOTICE` files. Sufficient for source distribution; **not** sufficient for binary distribution under Apache-2.0 section 4. See README for the classpath audit (165 components, 5 declaring no licence). |
 | Compose UI tests for Close/Copy | Complete | **10/10 pass on the S22** (Android 16) over Wi-Fi debugging |
 | Full instrumentation suite | Complete | **23/23 pass on both** the S22 (Android 16) and the Lenovo (Android 7.0) |
 | Back after a role change shows the new role | Complete | reported from device; `RelayNavigator.rebaseForRole`; `RoleNavigationTest` (9) + 2 on-device tests |
@@ -163,4 +164,4 @@ feature.
 | --- | --- |
 | Reconnect attempt counter resetting across engine restarts (RC-5) | Cosmetic status-text issue; recorded in `diagnostics/FINDINGS.md`. Fixing it means moving `ReconnectBackoff` ownership out of the run loop, which touches the reconnect path this round did not otherwise disturb. |
 | Listener port churn on reconnect (RC-6) | Costs one backoff step during recovery. Same reasoning: it is a change to the reconnect path, and the task scoped this round to state consistency. |
-| Application licence | No `LICENSE` file exists. Choosing one is the owner's decision; the app now states the position neutrally rather than inventing terms. |
+| Application licence | `GPL-3.0-or-later`. The unmodified GPL-3.0 text is in `LICENSE`; the About screen carries the notice GPLv3 section 5(d) requires, with a link to the source repository. |

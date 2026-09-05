@@ -52,11 +52,24 @@ android {
     }
     packaging {
         resources {
-            excludes += setOf(
-                "/META-INF/{AL2.0,LGPL2.1}",
-                "/META-INF/DEPENDENCIES",
+            // Legal text is merged, not dropped. These files were excluded to silence duplicate
+            // -path build errors, but excluding them throws away the licence texts and NOTICE
+            // content that Apache-2.0 section 4 requires a *binary* distribution to carry.
+            // Merging concatenates every copy instead, so nothing is lost to a name collision.
+            merges += setOf(
                 "/META-INF/LICENSE.md",
                 "/META-INF/LICENSE-notice.md",
+                "/META-INF/NOTICE.md",
+                "/META-INF/NOTICE",
+                "/META-INF/LICENSE",
+                "/META-INF/LICENSE.txt",
+                "/META-INF/NOTICE.txt",
+            )
+            // Build-time dependency metadata, not a legal notice; and the coroutines dual-licence
+            // marker files, which carry no text of their own.
+            excludes += setOf(
+                "/META-INF/DEPENDENCIES",
+                "/META-INF/{AL2.0,LGPL2.1}",
             )
         }
     }

@@ -6,7 +6,7 @@
 
 Over Wi-Fi or a hotspot. No internet, no account, no server, no cloud.
 
-`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `331 JVM + 31 device tests`  ·  `local network only`  ·  `GPL-3.0`
+`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `331 JVM + 31 device tests`  ·  `local network only`  ·  `GPL-3.0-or-later`
 
 </div>
 
@@ -413,8 +413,14 @@ design. Restarting the phone sometimes clears it.
 
 ## Licence
 
-RelayDisplay is free software, licensed under the **GNU General Public License v3.0**.
-The full text is in [`LICENSE`](LICENSE).
+RelayDisplay is free software under the **GNU General Public License, version 3 or later**.
+
+- **SPDX identifier:** `GPL-3.0-or-later`
+- **Full text:** [`LICENSE`](LICENSE) (unmodified GPL-3.0)
+- **Source:** <https://github.com/avina5hkr/relay-display>
+
+The notice says "either version 3 of the License, or (at your option) any later version", so the
+correct identifier is `GPL-3.0-or-later`, not `GPL-3.0-only`.
 
 ```
 Copyright (C) 2026 Avinash Kumar
@@ -436,12 +442,41 @@ In practice that means anyone may use, study, modify and redistribute this app �
 version that is distributed must ship its source under these same terms. The app satisfies the
 licence's notice requirement in **Settings → About and licences → App licence**.
 
+### Reproducing a released build
+
+A released APK corresponds to exactly one commit. Releases are tagged, and the version shown in
+**Settings → About and licences** identifies the tag to check out. Building that tag with the
+documented JDK reproduces the source the binary was made from, which is what the GPL requires you
+to be able to hand over.
+
 ### Third-party components
 
-Dependencies keep their own licences, which are unaffected by the above. Every one that ships in
-the APK is Apache 2.0 — compatible with GPLv3 — except `desugar_jdk_libs`, which is GPL v2 with
-the Classpath Exception and is used at build time.
+Dependencies keep their own licences, unaffected by the above. The build generates
+`assets/third_party_licenses.txt` by reading the `<licenses>` block of each artifact's own POM on
+the **resolved release runtime classpath** — nothing hand-written, nothing inferred.
 
-The build generates `assets/third_party_licenses.txt` from the real POM metadata of every
-component in the APK, and the app displays it under **Settings → About and licences → Open
-source**.
+Audit of that classpath as of this commit:
+
+| | Count |
+|---|---:|
+| Components on the release runtime classpath | 165 |
+| Declaring a licence in their POM | 160 |
+| **Declaring no licence in their POM** | **5** |
+
+The five that declare nothing are reported as `not declared in POM` rather than guessed:
+`com.google.guava:guava`, `:failureaccess`, `:listenablefuture`,
+`com.google.auto.value:auto-value-annotations` and `com.google.zxing:core`. Their licences are
+well known in practice, but this repository will not assert a licence that an artifact does not
+publish.
+
+Declared licences are Apache-2.0 (158 declarations across five different spellings of the
+same licence), BSD-3-Clause (2) and MIT (1) — 161 declarations across 160 components, because one
+component declares two.
+Apache-2.0 is one-way compatible with GPLv3. `desugar_jdk_libs` is GPL v2 with the Classpath
+Exception and is used at build time.
+
+> **Known gap.** That asset contains licence *names and URLs*, not full licence texts, copyright
+> notices or `NOTICE` file contents. For a source-only distribution that is adequate; for binary
+> distribution, Apache-2.0 §4 requires shipping the licence text and any `NOTICE`. Closing that
+> gap is tracked in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and is not
+> claimed to be done.

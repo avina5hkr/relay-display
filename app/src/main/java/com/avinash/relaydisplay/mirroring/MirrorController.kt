@@ -36,6 +36,12 @@ sealed interface MirrorState {
  * Frames are sent with `trySend`, never the suspending send. A mirror that falls behind must
  * drop frames, not queue them: queueing would add latency without ever catching up, and would
  * grow memory while doing it.
+ *
+ * That is right for frames and wrong for everything else this class sends. `MirrorStart`,
+ * `MirrorConfig` and `MirrorStop` currently take the same lossy path, so a busy link can drop the
+ * messages that start, configure or stop a mirror. They share one bounded queue with the
+ * heartbeat, which is why a mirror can also take the whole session down; see
+ * `RelaySession.heartbeatLoop`.
  */
 class MirrorController(
     private val engine: SessionHost,
@@ -90,8 +96,11 @@ class MirrorController(
 
         val listener = object : ScreenEncoderListener {
             override fun onFormat(width: Int, height: Int, csd0: ByteArray, csd1: ByteArray) {
-                // Codec configuration must arrive before any frame, so this one is sent with the
-                // suspending path via the session's queue rather than dropped under pressure.
+                // KNOWN DEFECT: codec configuration must arrive before any frame, but this is
+                // trySend on the same 8-slot queue the video shares, so under pressure it is
+                // silently dropped and the display never configures its decoder. A comment here
+                // previously claimed this used "the suspending path"; it never did. Reliable,
+                // acknowledged mirror negotiation is the fix -- see docs/IMPLEMENTATION_STATUS.md.
                 session.trySend(
                     MirrorConfig(UUID.randomUUID(), width, height, rotationDegrees = 0, csd0 = csd0, csd1 = csd1),
                 )
