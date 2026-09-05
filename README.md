@@ -6,7 +6,9 @@
 
 Over Wi-Fi or a hotspot. No internet, no account, no server, no cloud.
 
-`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `331 JVM + 31 device tests`  ·  `local network only`  ·  `GPL-3.0-or-later`
+`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `local network only`  ·  `GPL-3.0-or-later`
+
+[![CI](https://github.com/avina5hkr/relay-display/actions/workflows/ci.yml/badge.svg)](https://github.com/avina5hkr/relay-display/actions/workflows/ci.yml)
 
 </div>
 
@@ -105,6 +107,23 @@ ads and no account system — see [`docs/SECURITY.md`](docs/SECURITY.md).
 Both phones must be able to reach each other on a local network. Mobile data alone will not work.
 
 ---
+
+## Installing
+
+**No release has been published yet.** When one is, it will appear on the
+[Releases page](https://github.com/avina5hkr/relay-display/releases).
+
+| File | What to do with it |
+|---|---|
+| `RelayDisplay-<version>.apk` | **This is the one you install.** Put it on both phones. |
+| `RelayDisplay-<version>.aab` | Play Console upload format — **not installable**. Ignore it. |
+| `RelayDisplay-<version>-mapping.txt` | R8 mapping, for deobfuscating a crash report. |
+| `SHA256SUMS` | Checksums. Verify before installing: `sha256sum -c SHA256SUMS`. |
+
+Both phones need the **same** APK. Android will refuse an update signed by a different key, so
+install from the same source each time.
+
+RelayDisplay is **not on the Play Store**, and this document does not claim a timeline for that.
 
 ## Building
 
@@ -409,6 +428,7 @@ design. Restarting the phone sometimes clears it.
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model, mitigations, residual risks |
 | [`docs/TESTING.md`](docs/TESTING.md) | Commands, per-suite coverage, the two-device acceptance matrix and its results |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | What is done, what is not, and why |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | Signing key handling, GitHub setup, the release process and the physical two-phone checklist |
 | [`diagnostics/FINDINGS.md`](diagnostics/FINDINGS.md) | Correlated two-device timelines from real-device debugging |
 
 ## Licence
