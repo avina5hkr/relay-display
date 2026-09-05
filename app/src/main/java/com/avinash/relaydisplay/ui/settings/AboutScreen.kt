@@ -345,10 +345,16 @@ private fun readLicenceAsset(assets: AssetManager): List<LicenceEntry> = try {
 private const val LICENCE_ASSET = "third_party_licenses.txt"
 
 /**
- * The application's own licence status.
+ * The application's own licence.
  *
- * Stated as a fact, not a choice made on the owner's behalf: this repository contains no LICENSE
- * file, so no licence is claimed here. Adding one is the owner's decision.
+ * GPLv3 section 5(d) requires an interactive program to display Appropriate Legal Notices, so
+ * this is not decoration -- it is how the app satisfies the licence it ships under. It states the
+ * licence, the copyright holder, the no-warranty disclaimer, and where to get the source, because
+ * those are the four things the notice is required to carry.
+ *
+ * Keep this in step with the LICENSE file. If the repository's licence ever changes, this screen
+ * changes with it; a program whose About screen names the wrong licence is worse than one that
+ * names none.
  */
 @Composable
 private fun AppLicenceTabContent() {
@@ -356,17 +362,43 @@ private fun AppLicenceTabContent() {
         Text("RelayDisplay itself", style = MaterialTheme.typography.titleLarge)
         VerticalGap(RelayDimens.SmallGap)
         Text(
-            "No open-source licence has been chosen for this application. All rights in the " +
-                "RelayDisplay source code remain with its author.",
+            "Copyright \u00a9 2026 Avinash Kumar",
             style = MaterialTheme.typography.bodyLarge,
         )
         VerticalGap(RelayDimens.SmallGap)
         Text(
-            "This is a statement of the current state of the project, not a licence grant. If " +
-                "you want RelayDisplay to be open source, add a LICENSE file to the repository " +
-                "and this screen will need updating to match it.",
+            "RelayDisplay is free software: you can redistribute it and/or modify it under the " +
+                "terms of the GNU General Public License as published by the Free Software " +
+                "Foundation, either version 3 of the License, or (at your option) any later " +
+                "version.",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        VerticalGap(RelayDimens.SmallGap)
+        Text(
+            "This program is distributed in the hope that it will be useful, but WITHOUT ANY " +
+                "WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR " +
+                "A PARTICULAR PURPOSE. See the GNU General Public License for more details.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        VerticalGap(RelayDimens.SmallGap)
+        Text(
+            "You should have received a copy of the GNU General Public License along with this " +
+                "program. If not, see https://www.gnu.org/licenses/.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    SectionHeader("Getting the source")
+    RelayCard {
+        // No repository URL is printed here because none has been published. Inventing one would
+        // be worse than saying nothing: a dead link in a legal notice is a broken promise.
+        Text(
+            "The GPL gives you the right to the complete source code that this app was built " +
+                "from. Whoever supplied you with this build is required by the licence to make " +
+                "that source available to you on request, under these same terms.",
+            style = MaterialTheme.typography.bodyMedium,
         )
     }
 

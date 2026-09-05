@@ -6,7 +6,7 @@
 
 Over Wi-Fi or a hotspot. No internet, no account, no server, no cloud.
 
-`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `331 JVM + 31 device tests`  ·  `local network only`  ·  `no licence chosen`
+`Android 6.0+`  ·  `Kotlin 2.2.10`  ·  `Compose Material 3`  ·  `331 JVM + 31 device tests`  ·  `local network only`  ·  `GPL-3.0`
 
 </div>
 
@@ -25,8 +25,29 @@ Nothing is uploaded anywhere, because there is nowhere to upload it to.
 
 ---
 
+## Screenshots
+
+Real captures from the two devices this was built against — a Galaxy S22 Ultra running the
+controller in dark theme, and a Lenovo K33a42 as the display in light theme.
+
+<table>
+<tr>
+<td width="33%" align="center"><img src="docs/screenshots/controller-dashboard.png" width="230" alt="Controller dashboard: a connection status card reading Connected to Lenovo K33a42, above a grid of six tiles"><br><sub><b>Controller</b><br>One tile per thing you can send</sub></td>
+<td width="33%" align="center"><img src="docs/screenshots/controller-send.png" width="230" alt="Send screen titled Send text, with a draft field and Show as text as the primary action"><br><sub><b>Send</b><br>Opens on the kind you tapped</sub></td>
+<td width="33%" align="center"><img src="docs/screenshots/about-licence.png" width="230" alt="About and licences screen showing the GPL v3 notice and copyright line"><br><sub><b>About</b><br>The licence notice</sub></td>
+</tr>
+<tr>
+<td width="33%" align="center"><img src="docs/screenshots/display-text.png" width="230" alt="Companion display showing large white text on black, with copy and close buttons in the top right"><br><sub><b>Display: text</b><br>Copy and close, top right</sub></td>
+<td width="33%" align="center"><img src="docs/screenshots/display-qr.png" width="230" alt="Companion display showing a QR code with a white quiet zone on a black background"><br><sub><b>Display: QR</b><br>Drawn as whole pixels</sub></td>
+<td width="33%" align="center"><img src="docs/screenshots/display-waiting.png" width="230" alt="Companion display dashboard in light theme, status reading Connected to samsung SM-S908E"><br><sub><b>Display: waiting</b><br>Light theme</sub></td>
+</tr>
+</table>
+
+---
+
 ## Contents
 
+- [Screenshots](#screenshots)
 - [What it can do](#what-it-can-do)
 - [What it cannot do](#what-it-cannot-do)
 - [Supported devices](#supported-devices)
@@ -392,10 +413,35 @@ design. Restarting the phone sometimes clears it.
 
 ## Licence
 
-**No licence has been chosen for this project yet.** There is no `LICENSE` file in the repository,
-so no rights are granted to anyone else — default copyright applies. If you want this to be open
-source, add a licence file; until then it is not, and the app does not claim to be.
+RelayDisplay is free software, licensed under the **GNU General Public License v3.0**.
+The full text is in [`LICENSE`](LICENSE).
 
-Third-party dependencies keep their own licences. The build generates
-`assets/third_party_licenses.txt` from the real POM metadata of every component that ships in the
-APK, and the app displays it under **Settings → About and licences**.
+```
+Copyright (C) 2026 Avinash Kumar
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program.  If not, see <https://www.gnu.org/licenses/>.
+```
+
+In practice that means anyone may use, study, modify and redistribute this app — but a modified
+version that is distributed must ship its source under these same terms. The app satisfies the
+licence's notice requirement in **Settings → About and licences → App licence**.
+
+### Third-party components
+
+Dependencies keep their own licences, which are unaffected by the above. Every one that ships in
+the APK is Apache 2.0 — compatible with GPLv3 — except `desugar_jdk_libs`, which is GPL v2 with
+the Classpath Exception and is used at build time.
+
+The build generates `assets/third_party_licenses.txt` from the real POM metadata of every
+component in the APK, and the app displays it under **Settings → About and licences → Open
+source**.
