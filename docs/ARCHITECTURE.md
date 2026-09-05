@@ -142,6 +142,30 @@ remote screen.** Sending content sets `SENDING`/`SENT`; only a report from the D
 Failed, because "I put it on the wire" and "the other phone drew it" are genuinely different
 facts and the old UI conflated them.
 
+### Outbound traffic classes
+
+One connection carries video, control and bulk transfer. They must not share a queue.
+
+| Class | Queue | Full behaviour | Carries |
+| --- | ---: | --- | --- |
+| `CONTROL` | 32 | close the session | Ping/Pong, Bye, Ack, errors, presentation state and commands, text/QR/link, **all mirror negotiation and teardown** |
+| `BULK` | 8 | suspend the sender | transfer chunks |
+| `MEDIA` | 3 | drop oldest | encoded video frames only |
+
+One writer drains them with strict priority for `CONTROL`, then alternates `BULK` and `MEDIA` so
+neither starves the other. Classification lives in `RelayMessage.trafficClass()` so a new message
+type has to choose, and the default for anything unclassified is `CONTROL` — the safe failure is
+to deliver reliably, not to drop.
+
+**Why this exists.** Every message used to share one 8-slot channel. `MirrorController` submits
+~24 frames a second, so the queue was routinely full, and `heartbeatLoop` responded to a `Ping`
+that would not enqueue by closing the whole session with "outbound queue full". Pings land at 15,
+30, 45 and 60 seconds; each was a fresh chance to kill a healthy mirror. That is the mechanism
+behind mirroring stopping about a minute after it started.
+
+The heartbeat still closes on a full `CONTROL` queue, because that genuinely means the writer is
+wedged — video and transfers can no longer fill it.
+
 ### Stopping is the hard part
 
 Three of the four bugs found in the first real two-device run were the same shape: something

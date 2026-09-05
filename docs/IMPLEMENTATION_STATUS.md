@@ -118,7 +118,8 @@ Last updated after the Milestone 8 build.
 | Repeated role-change tap is safe | Complete | `Mutex.tryLock`; `a repeated tap while switching is dropped, not queued` |
 | One consistent phrase for closing | Complete | `CLOSE_ON_DISPLAY` = "Close on display" |
 | About & Legal accurate and redesigned | Complete | four tabs; notices generated from resolved POMs |
-| Notices survive R8 | Complete | `assets/third_party_licenses.txt` present in the release APK |
+| Notices survive R8 | Complete | `assets/third_party_licenses.txt` present in the release APK; verified by unzipping the R8 output |
+| Third-party notice completeness | **Not complete** | The generated asset carries POM licence *names and URLs*, not full licence texts or `NOTICE` files. Sufficient for source distribution; **not** sufficient for binary distribution under Apache-2.0 section 4. See README for the classpath audit (165 components, 5 declaring no licence). |
 | Compose UI tests for Close/Copy | Complete | **10/10 pass on the S22** (Android 16) over Wi-Fi debugging |
 | Full instrumentation suite | Complete | **23/23 pass on both** the S22 (Android 16) and the Lenovo (Android 7.0) |
 | Back after a role change shows the new role | Complete | reported from device; `RelayNavigator.rebaseForRole`; `RoleNavigationTest` (9) + 2 on-device tests |
@@ -126,6 +127,24 @@ Last updated after the Milestone 8 build.
 | Mode/fit rows tappable across full width | Complete | found by instrumentation; `selectable` with `Role.RadioButton` |
 | Two-device regression matrix | **Blocked** | needs both phones attached and unlocked at once |
 | Mirroring verified on hardware | **Partial** | reported working by the user; not re-verified after these changes |
+
+## Mirroring reliability (Phase 2)
+
+Diagnosed from code, fixed, and covered by tests. **Not hardware-verified: no device was attached
+during this work.**
+
+| Defect | State |
+| --- | --- |
+| **A. Control starvation** — one 8-slot queue shared by video, heartbeat and all control; heartbeat closed the session on a full queue | **Fixed.** Split into CONTROL/BULK/MEDIA with a strict-priority writer. Covered by `OutboundPriorityTest` and two `LoopbackSessionTest` cases over a real encrypted session. **A real latent defect, but hardware testing showed it is _not_ the cause of the reported one-minute failure** — see `docs/TESTING.md`. |
+| **B. Capture surviving session termination** | **Fixed and hardware-verified.** Capture is now bound to the exact `RelaySession` that started it and stops the moment that session ends or is replaced. Measured on device: killing the Display process stopped capture in **1 s** (previously still running after 4 minutes), with `dumpsys media_projection` reporting `null`, the foreground service gone and the indicator cleared. A reconnect deliberately does **not** rebind capture — resuming silently would stream the user's screen to a session they never consented to. |
+| **C. Reliable mirror negotiation** | **Partly.** MirrorStart/Config/Stop are now CONTROL class, so they are no longer dropped under video pressure. There is still no mirrorId/epoch, no ACK and no MirrorReady handshake. |
+| **D. Decoder failures not reported to the Controller** | **Not done.** |
+| **E. Surface lifecycle modelling** | **Not done.** |
+| **F. Oversized encoded frames (192 KiB cap)** | **Not done.** A keyframe over the cap still throws `PAYLOAD_TOO_LARGE` and closes the session. |
+| **G. Inbound `DROP_OLDEST` shared by control and media** | **Not done.** `RelayEngine._messages` is still one `MutableSharedFlow(extraBufferCapacity = 32, DROP_OLDEST)`. |
+| **H. Mirror health protocol** | **Not done.** |
+| **I. MediaProjection service review** | **Not done.** |
+| **J. Codec robustness review** | **Not done.** |
 
 ## First two-device run
 
@@ -163,4 +182,4 @@ feature.
 | --- | --- |
 | Reconnect attempt counter resetting across engine restarts (RC-5) | Cosmetic status-text issue; recorded in `diagnostics/FINDINGS.md`. Fixing it means moving `ReconnectBackoff` ownership out of the run loop, which touches the reconnect path this round did not otherwise disturb. |
 | Listener port churn on reconnect (RC-6) | Costs one backoff step during recovery. Same reasoning: it is a change to the reconnect path, and the task scoped this round to state consistency. |
-| Application licence | No `LICENSE` file exists. Choosing one is the owner's decision; the app now states the position neutrally rather than inventing terms. |
+| Application licence | `GPL-3.0-or-later`. The unmodified GPL-3.0 text is in `LICENSE`; the About screen carries the notice GPLv3 section 5(d) requires, with a link to the source repository. |

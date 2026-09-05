@@ -1,8 +1,10 @@
 package com.avinash.relaydisplay.ui.settings
 
+import android.content.Intent
 import android.content.res.AssetManager
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,9 +17,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -32,8 +34,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.core.net.toUri
 import com.avinash.relaydisplay.BuildConfig
 import com.avinash.relaydisplay.ui.common.RelayCard
 import com.avinash.relaydisplay.ui.common.RelayDetailBar
@@ -344,6 +351,34 @@ private fun readLicenceAsset(assets: AssetManager): List<LicenceEntry> = try {
 
 private const val LICENCE_ASSET = "third_party_licenses.txt"
 
+/** The one place the app opens an external URL, and only on an explicit tap. */
+const val SOURCE_URL = "https://github.com/avina5hkr/relay-display"
+
+@Composable
+private fun SourceLink() {
+    val context = LocalContext.current
+    Text(
+        text = SOURCE_URL,
+        style = MaterialTheme.typography.bodyLarge,
+        color = MaterialTheme.colorScheme.primary,
+        textDecoration = TextDecoration.Underline,
+        modifier = Modifier
+            .heightIn(min = RelayDimens.MinTouchTarget)
+            .clickable(role = Role.Button) {
+                // No verification of the resolved activity: a device with no browser simply has
+                // nothing to start, and that throws rather than failing silently.
+                runCatching {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, SOURCE_URL.toUri())
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+            }
+            .semantics { contentDescription = "Open the RelayDisplay source repository" }
+            .testTag("source_link"),
+    )
+}
+
 /**
  * The application's own licence.
  *
@@ -392,22 +427,31 @@ private fun AppLicenceTabContent() {
 
     SectionHeader("Getting the source")
     RelayCard {
-        // No repository URL is printed here because none has been published. Inventing one would
-        // be worse than saying nothing: a dead link in a legal notice is a broken promise.
         Text(
             "The GPL gives you the right to the complete source code that this app was built " +
                 "from. Whoever supplied you with this build is required by the licence to make " +
                 "that source available to you on request, under these same terms.",
             style = MaterialTheme.typography.bodyMedium,
         )
+        VerticalGap(RelayDimens.SmallGap)
+        SourceLink()
+        VerticalGap(RelayDimens.SmallGap)
+        Text(
+            "A released build corresponds to one exact commit. Match the version above against " +
+                "the repository's tag or commit for that release to get the source it was " +
+                "actually built from.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 
     SectionHeader("Third-party components")
     RelayCard {
         Text(
-            "The libraries RelayDisplay is built on have their own licences, which are separate " +
-                "from the status above and are listed in full under Open source. Their copyright " +
-                "notices are preserved there and are included in release builds.",
+            "The libraries RelayDisplay is built on have their own licences, separate from the " +
+                "licence above. Open source lists every component on the release classpath with " +
+                "the licence name and URL declared in its own POM. Those are identifiers, not " +
+                "the full licence texts, and they are not copyright notices or NOTICE files.",
             style = MaterialTheme.typography.bodyMedium,
         )
     }

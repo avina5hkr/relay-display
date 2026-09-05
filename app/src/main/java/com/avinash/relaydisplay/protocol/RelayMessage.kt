@@ -326,11 +326,26 @@ data class MirrorConfig(
     override fun hashCode() = messageHash(this)
 }
 
+/**
+ * One fragment of an encoded video frame.
+ *
+ * A whole H.264 access unit does not fit in one record: a full-screen keyframe -- which is exactly
+ * what an app switch produces -- routinely exceeds the 192 KiB field cap. Sending one anyway made
+ * the receiver reject the record with PAYLOAD_TOO_LARGE, and that tore down the whole session.
+ * Observed on hardware: pressing Home and opening another app killed the session within seconds.
+ *
+ * So frames are fragmented. [frameSequence] groups the fragments of one frame, [fragmentIndex] and
+ * [fragmentCount] order and terminate it. A single-fragment frame is index 0 of count 1, which is
+ * what every small P-frame is.
+ */
 data class MirrorFrame(
     override val id: UUID,
     val presentationTimeUs: Long,
     val keyFrame: Boolean,
     val data: ByteArray,
+    val frameSequence: Long = 0,
+    val fragmentIndex: Int = 0,
+    val fragmentCount: Int = 1,
 ) : RelayMessage {
     override val type get() = MessageType.MIRROR_FRAME
     override fun equals(other: Any?) = this === other || (other is MirrorFrame && messageEquals(this, other))

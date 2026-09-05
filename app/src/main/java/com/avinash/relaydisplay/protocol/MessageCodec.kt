@@ -30,6 +30,18 @@ object MessageCodec {
     private const val MAX_DETAIL_BYTES = 512
     private const val MAX_CSD_BYTES = 4096
     private const val MAX_MIRROR_FRAME_BYTES = 192 * 1024
+
+    /**
+     * The largest single fragment on the wire.
+     *
+     * 64 KiB keeps a fragment far below the field cap and the record cap, so a fragment can never
+     * be the thing that trips PAYLOAD_TOO_LARGE. Sixteen of these is a 1 MiB frame, which is
+     * larger than any keyframe this encoder produces at 720p.
+     */
+    const val MAX_MIRROR_FRAGMENT_BYTES = 64 * 1024
+
+    /** Bounds reassembly memory: 16 x 64 KiB. A frame needing more is dropped, not buffered. */
+    const val MAX_MIRROR_FRAGMENTS = 16
     private const val SHA256_BYTES = 32
 
     fun encode(message: RelayMessage): ByteArray {
@@ -186,6 +198,9 @@ object MessageCodec {
                 w.putI64(1, m.presentationTimeUs)
                 w.putBool(2, m.keyFrame)
                 w.putBytes(3, m.data)
+                w.putI64(4, m.frameSequence)
+                w.putI64(5, m.fragmentIndex.toLong())
+                w.putI64(6, m.fragmentCount.toLong())
             }
             is MirrorStop -> w.putString(1, m.reason)
             is PresentationStateMessage -> {
@@ -353,7 +368,12 @@ object MessageCodec {
             id = id,
             presentationTimeUs = t.i64(1),
             keyFrame = t.bool(2),
-            data = t.bytes(3, MAX_MIRROR_FRAME_BYTES),
+            // Each fragment is capped, not the whole frame; MAX_MIRROR_FRAGMENT_BYTES leaves
+            // headroom under the field cap for the rest of the record.
+            data = t.bytes(3, MAX_MIRROR_FRAGMENT_BYTES),
+            frameSequence = t.optI64(4) ?: 0,
+            fragmentIndex = (t.optI64(5) ?: 0).toInt(),
+            fragmentCount = (t.optI64(6) ?: 1).toInt(),
         )
         MessageType.MIRROR_STOP -> MirrorStop(id, t.string(1, MAX_DETAIL_BYTES))
         MessageType.PRESENTATION_STATE -> PresentationStateMessage(

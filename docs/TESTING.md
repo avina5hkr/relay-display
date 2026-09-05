@@ -430,6 +430,92 @@ The controller phone has a two-minute screen timeout, a secure lock and no charg
 between steps and `ActivityScenario`-free adb driving stops with it. The remaining rows need it
 unlocked and awake.
 
+### Phase 1 / Phase 2A verification (single device)
+
+Run on the S22 Ultra (Android 16 / API 36) over wireless debugging. **The Lenovo was off-network,
+so nothing two-device was run** -- no mirroring soak, no matrix.
+
+| Check | Result |
+| --- | --- |
+| `testDebugUnitTest` | 339 tests, 0 failures (was 331) |
+| `lintDebug` | 0 errors |
+| `assembleDebug` / `assembleRelease` | both succeed |
+| `connectedDebugAndroidTest` on S22 | **31 tests, 0 failures** -- read from the result XML, not the BUILD line |
+| App licence screen renders the GPL notice | pass -- copyright, grant, warranty disclaimer and where to get a copy all present |
+| Source link opens the repository | pass -- tapping it left RelayDisplay and opened `avina5hkr / relay-display` |
+| Legal asset survives R8 | pass -- `assets/third_party_licenses.txt`, 25,267 bytes, readable from the release APK |
+| `META-INF/LICENSE.txt` now packaged | pass -- 12,484 bytes, previously excluded |
+
+The instrumentation suite passing after the queue split is a regression check, not a mirroring
+test: none of those 31 tests exercise a live session between two phones.
+
+### Two-device reproduction of the mirror failure (baseline 0bfb9e5)
+
+Run on the actual pair: S22 Ultra (Android 16) as Controller, Lenovo K33a42 (Android 7.0) as
+Display, same Wi-Fi subnet, paired fresh by comparing the six-digit code. Both phones ran a debug
+APK built from **0bfb9e5**, i.e. before the queue split, so the failure could be observed as
+reported.
+
+#### It does not fail while the app is in the foreground
+
+| Condition | Result |
+| --- | --- |
+| App foregrounded, screen scrolling continuously | **healthy for 276 s**, ~500 KB/s sustained at the Display, MediaProjection active throughout |
+
+Pings land at 15, 30, 45, 60 s and every one survived. **The control-starvation theory does not
+explain the reported symptom.** On a fast local link the writer keeps up, the shared queue rarely
+fills, and the heartbeat never fails to enqueue.
+
+#### It fails within ~30 s of backgrounding the Controller app
+
+Backgrounding RelayDisplay and opening another app (Settings, then Gallery) reproduced it
+immediately:
+
+```
+03:21:23  mirroring started, projection=1
+          ... 276 s healthy, ~500 KB/s to the Display ...
+03:27:29  RelayDisplay backgrounded, Settings opened
+          throughput halves: 500 KB/s -> ~280 KB/s
+03:28:10  Display: "RD/Session: session ended", Connected -> Reconnecting(#1)
+03:28:29  Display established sockets = 0, listening = 1
+          Controller MediaProjection = 1   <-- still capturing
+```
+
+#### What the Controller was doing four minutes later
+
+```
+03:31:56  D  mirror: dropped 11520 frames to keep up
+03:31:56  D  session: Connecting -> Reconnecting(#12)
+          UI: "Reconnecting (attempt 11). The other phone did not answer."
+          dumpsys media_projection: com.avinash.relaydisplay TYPE_SCREEN_CAPTURE
+```
+
+The session died at 03:28:10. At 03:31:56 the Controller was still holding `MediaProjection`, still
+running the encoder, and still incrementing a dropped-frame counter for a peer that had been gone
+for nearly four minutes. The capture indicator stayed lit the whole time, and the screen being
+captured was the user's photo gallery.
+
+**This is defect B, not defect A.** `MirrorController` captures `engine.activeSession.value` once
+at start; when that session closes, nothing stops the encoder, releases the `VirtualDisplay` or
+tears down the projection. Reconnect then builds a *new* session that the running capture is not
+attached to, which is why the Display never resumes and the Controller never notices.
+
+The Display half behaved correctly: it detected the drop, showed the frozen last frame with
+"Controller disconnected", closed cleanly and went back to listening.
+
+#### A diagnosability defect found on the way
+
+`mirror: dropped N frames to keep up` is emitted roughly once a second while a mirror is failing.
+The diagnostics log is bounded, so those messages evicted the original session-close reason before
+it could be read. A log that floods itself during the exact failure it exists to explain is not
+much use; the drop counter belongs in a metric, not in the event log.
+
+### Still not verified on hardware
+
+The one-minute mirror failure was diagnosed from code and fixed, and the fix is covered by tests
+over a real encrypted loopback session. It has **not** been reproduced or confirmed fixed on the
+phones, because that needs the Companion Display attached at the same time as the Controller.
+
 ### Visual defects found by reading screenshots
 
 Three rounds now, the same method has found things no assertion did. Screenshots are taken with

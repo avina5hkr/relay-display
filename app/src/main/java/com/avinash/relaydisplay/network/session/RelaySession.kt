@@ -18,7 +18,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -54,8 +57,34 @@ class RelaySession(
 ) {
     private val job = Job(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
-    private val outbound = Channel<RelayMessage>(capacity = OUTBOUND_QUEUE)
+    // Three queues, not one. See TrafficClass for why: a single shared queue let ~24 fps of video
+    // starve the heartbeat, and the heartbeat's response to that was to close the session.
+    private val control = Channel<Queued>(capacity = CONTROL_QUEUE)
+    private val bulk = Channel<Queued>(capacity = BULK_QUEUE)
+    private val media = Channel<Queued>(
+        capacity = MEDIA_QUEUE,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
     private val closed = AtomicBoolean(false)
+
+    private val mediaDropped = AtomicLong(0)
+    private val maxControlDelayMs = AtomicLong(0)
+
+    /** A message plus when it was queued, so control latency can be measured rather than guessed. */
+    private data class Queued(val message: RelayMessage, val queuedAtMs: Long)
+
+    /** Queue depths and drop counts. Read by diagnostics and asserted by tests. */
+    fun metrics(): OutboundMetrics = OutboundMetrics(
+        controlDepth = controlDepth.get(),
+        bulkDepth = bulkDepth.get(),
+        mediaDepth = mediaDepth.get(),
+        mediaDropped = mediaDropped.get(),
+        maxControlDelayMs = maxControlDelayMs.get(),
+    )
+
+    private val controlDepth = java.util.concurrent.atomic.AtomicInteger(0)
+    private val bulkDepth = java.util.concurrent.atomic.AtomicInteger(0)
+    private val mediaDepth = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * Ids of commands already applied.
@@ -86,12 +115,32 @@ class RelaySession(
      * Returns false when the queue is full, which is the backpressure signal: the caller (a bulk
      * transfer) must wait rather than buffer more in memory.
      */
-    fun trySend(message: RelayMessage): Boolean = outbound.trySend(message).isSuccess
+    fun trySend(message: RelayMessage): Boolean {
+        val queued = Queued(message, nowMs())
+        return when (message.trafficClass()) {
+            TrafficClass.CONTROL -> control.trySend(queued).isSuccess.also { if (it) controlDepth.incrementAndGet() }
+            TrafficClass.BULK -> bulk.trySend(queued).isSuccess.also { if (it) bulkDepth.incrementAndGet() }
+            // DROP_OLDEST means this effectively always succeeds; a full queue silently discards
+            // the stalest frame instead. That is the point: a late frame is worth nothing, and
+            // refusing new ones would freeze the mirror on whatever was already queued.
+            TrafficClass.MEDIA -> {
+                val before = mediaDepth.get()
+                media.trySend(queued)
+                if (before >= MEDIA_QUEUE) mediaDropped.incrementAndGet() else mediaDepth.incrementAndGet()
+                true
+            }
+        }
+    }
 
     /** Suspends until the message is queued. Used by bulk transfers to apply backpressure. */
     suspend fun send(message: RelayMessage) {
+        val queued = Queued(message, nowMs())
         try {
-            outbound.send(message)
+            when (message.trafficClass()) {
+                TrafficClass.CONTROL -> { control.send(queued); controlDepth.incrementAndGet() }
+                TrafficClass.BULK -> { bulk.send(queued); bulkDepth.incrementAndGet() }
+                TrafficClass.MEDIA -> { media.send(queued); mediaDepth.incrementAndGet() }
+            }
         } catch (e: kotlinx.coroutines.channels.ClosedSendChannelException) {
             throw IOException("session closed", e)
         }
@@ -140,10 +189,50 @@ class RelaySession(
         }
     }
 
+    /**
+     * One writer, strict priority for control, with fairness between bulk and media.
+     *
+     * Control is drained completely before anything else is considered, so a control message can
+     * never sit behind a queue of video frames. Bulk and media then alternate, so neither can
+     * starve the other: a long file transfer must not freeze a mirror, and a mirror must not
+     * block a transfer forever.
+     */
+    private suspend fun nextOutbound(): Queued? {
+        // Anything already queued as control goes first, without suspending.
+        control.tryReceive().getOrNull()?.let { controlDepth.decrementAndGet(); return it }
+
+        // Alternate the two lossy/bulk sources so a busy one cannot monopolise the writer.
+        val first = if (preferBulk) bulk else media
+        val second = if (preferBulk) media else bulk
+        preferBulk = !preferBulk
+        first.tryReceive().getOrNull()?.let { decrementFor(first); return it }
+        second.tryReceive().getOrNull()?.let { decrementFor(second); return it }
+
+        // Nothing queued anywhere: suspend until something arrives, control included.
+        return select {
+            control.onReceiveCatching { r -> r.getOrNull()?.also { controlDepth.decrementAndGet() } }
+            bulk.onReceiveCatching { r -> r.getOrNull()?.also { bulkDepth.decrementAndGet() } }
+            media.onReceiveCatching { r -> r.getOrNull()?.also { mediaDepth.decrementAndGet() } }
+        }
+    }
+
+    private var preferBulk = true
+
+    private fun decrementFor(channel: Channel<Queued>) = when (channel) {
+        bulk -> bulkDepth.decrementAndGet()
+        media -> mediaDepth.decrementAndGet()
+        else -> controlDepth.decrementAndGet()
+    }
+
     private suspend fun writeLoop() {
         try {
-            for (message in outbound) {
-                withContext(Dispatchers.IO) { connection.write(message) }
+            while (scope.isActive) {
+                val queued = nextOutbound() ?: break
+                if (queued.message.trafficClass() == TrafficClass.CONTROL) {
+                    val waited = nowMs() - queued.queuedAtMs
+                    maxControlDelayMs.getAndUpdate { existing -> maxOf(existing, waited) }
+                }
+                withContext(Dispatchers.IO) { connection.write(queued.message) }
             }
         } catch (e: CancellationException) {
             throw e
@@ -163,9 +252,12 @@ class RelaySession(
                 closeInternal(RelayError.ConnectFailed("peer silent for ${silentFor}ms"))
                 return
             }
-            // A ping that cannot even be queued means the writer is wedged; treat it as dead.
+            // A ping that cannot be queued now means the *control* queue is full, which only
+            // happens if the writer is genuinely wedged -- video and bulk transfers have their
+            // own queues and cannot fill this one. Previously every traffic class shared one
+            // 8-slot channel, so a busy mirror closed healthy sessions here.
             if (!trySend(Ping(UUID.randomUUID(), nowMs()))) {
-                closeInternal(RelayError.ConnectFailed("outbound queue full"))
+                closeInternal(RelayError.ConnectFailed("control queue full"))
                 return
             }
         }
@@ -181,7 +273,9 @@ class RelaySession(
 
     private fun closeInternal(error: RelayError?) {
         if (!closed.compareAndSet(false, true)) return
-        outbound.close()
+        control.close()
+        bulk.close()
+        media.close()
         connection.close()
         outcome.keys.destroy()
         job.cancel()
@@ -198,7 +292,14 @@ class RelaySession(
          * Deep enough that a burst of transfer chunks does not stall on every send, shallow
          * enough that a slow peer produces backpressure instead of unbounded memory growth.
          */
-        const val OUTBOUND_QUEUE = 8
+        /** Small: control messages are tiny and must never back up. */
+        const val CONTROL_QUEUE = 32
+
+        /** Bounded, backpressured. A transfer that outruns the link should suspend, not buffer. */
+        const val BULK_QUEUE = 8
+
+        /** Deliberately tiny. Anything older than a few frames is not worth sending. */
+        const val MEDIA_QUEUE = 3
         const val MAX_REMEMBERED_COMMANDS = 256
     }
 }

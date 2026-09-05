@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.ui.unit.dp
 import com.avinash.relaydisplay.ui.common.ActionTile
 import com.avinash.relaydisplay.ui.common.ConnectionHero
+import androidx.compose.ui.Alignment
+import com.avinash.relaydisplay.mirroring.MirrorState
 import com.avinash.relaydisplay.ui.common.RelayGlyph
 import com.avinash.relaydisplay.ui.common.RelayIcon
 import com.avinash.relaydisplay.ui.common.RelaySection
@@ -58,6 +60,7 @@ fun ControllerHomeScreen(
 ) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val mirrorState by appContainer().mirrorController.state.collectAsStateWithLifecycle()
 
     // The same instance the send screen uses, keyed identically, so a file picked here and a
     // file picked there run through one code path and report progress in one place.
@@ -101,6 +104,18 @@ fun ControllerHomeScreen(
             // The visual anchor: colour carries the state before any text is read.
             ConnectionHero(state = ui.connection) {
                 PrimaryActionForState(ui = ui, viewModel = viewModel, onOpenPairing = onOpenPairing)
+            }
+
+            // Stopping a screen share was only reachable from the send screen, several taps and a
+            // scroll away. Anything that is recording the user's screen needs a stop control they
+            // can find while it is happening, so it sits directly under the status card and only
+            // while capture is actually running.
+            if (mirrorState is MirrorState.Active || mirrorState is MirrorState.Starting) {
+                VerticalGap(RelayDimens.SmallGap)
+                StopSharingCard(
+                    state = mirrorState,
+                    onStop = { MirrorProjectionService.stop(context) },
+                )
             }
 
             // Only renders on Android versions that actually gate local network access.
@@ -294,4 +309,43 @@ internal fun modeLabel(mode: OperatingMode): String = when (mode) {
     OperatingMode.ON_DEMAND -> "On demand"
     OperatingMode.ALWAYS_READY -> "Always ready"
     OperatingMode.PAUSED -> "Paused"
+}
+
+/**
+ * The screen-sharing stop control.
+ *
+ * Deliberately loud: it uses the error container, because a capture the user has lost track of is
+ * a privacy problem, not a neutral status. It states what is being shared so the row is not just
+ * a button with no context, and it is the only control on this screen that is destructive.
+ */
+@Composable
+private fun StopSharingCard(state: MirrorState, onStop: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    RelayCard(container = scheme.errorContainer) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RelayGlyph(RelayIcon.SCREEN_SHARE, tint = scheme.onErrorContainer, size = 26.dp)
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(
+                    "Sharing this screen",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = scheme.onErrorContainer,
+                )
+                Text(
+                    when (state) {
+                        is MirrorState.Active ->
+                            "${state.profile.width}x${state.profile.height}, ${state.profile.frameRate} fps"
+                        else -> "Starting"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = scheme.onErrorContainer.copy(alpha = 0.8f),
+                )
+            }
+        }
+        VerticalGap(RelayDimens.SmallGap)
+        PrimaryAction(
+            "Stop sharing",
+            onClick = onStop,
+            modifier = Modifier.testTag("stop_sharing_home"),
+        )
+    }
 }

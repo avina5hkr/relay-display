@@ -39,34 +39,13 @@ gradle-app.setting
 # Points at this machine's Android SDK. Android Studio regenerates it on first open.
 local.properties
 
-# Android Studio writes these next to the module when a project is imported in a different layout.
+# Android Studio project state. Formatting rules moved to .editorconfig, which every editor and
+# ktlint honour, so nothing under .idea needs tracking any more.
+.idea/
 *.iml
-.idea/caches/
-.idea/libraries/
-.idea/modules.xml
-.idea/workspace.xml
-.idea/navEditor.xml
-.idea/assetWizardSettings.xml
-.idea/deploymentTargetSelector.xml
-.idea/deploymentTargetDropDown.xml
-.idea/androidTestResultsUserPreferences.xml
-.idea/shelf/
-.idea/httpRequests/
-.idea/dictionaries/
-.idea/tasks.xml
-.idea/usage.statistics.xml
-.idea/sonarlint/
-
-# Per-developer editor preferences that Android Studio drops into .idea. markdown.xml records
-# which preview panel you personally chose; committing it would push that choice onto everyone
-# else, including the experimental Compose panel, which does not load remote images.
-.idea/markdown.xml
-.idea/jarRepositories.xml
-.idea/libraries-with-intellij-classes.xml
-.idea/kotlinc.xml
-
-# The rest of .idea is deliberately kept: codeStyles/ and compiler.xml make formatting and the
-# JVM target identical for everyone who opens the project, which is worth the small diff noise.
+*.bak
+*.tmp
+hs_err_pid*.log
 
 # Other editors
 .vscode/
