@@ -128,6 +128,24 @@ Last updated after the Milestone 8 build.
 | Two-device regression matrix | **Blocked** | needs both phones attached and unlocked at once |
 | Mirroring verified on hardware | **Partial** | reported working by the user; not re-verified after these changes |
 
+## Mirroring reliability (Phase 2)
+
+Diagnosed from code, fixed, and covered by tests. **Not hardware-verified: no device was attached
+during this work.**
+
+| Defect | State |
+| --- | --- |
+| **A. Control starvation** — one 8-slot queue shared by video, heartbeat and all control; heartbeat closed the session on a full queue | **Fixed.** Split into CONTROL/BULK/MEDIA with a strict-priority writer. Covered by `OutboundPriorityTest` and two `LoopbackSessionTest` cases over a real encrypted session. |
+| **B. Capture surviving session termination** | **Not done.** `MirrorController` still captures `engine.activeSession.value` once at start. |
+| **C. Reliable mirror negotiation** | **Partly.** MirrorStart/Config/Stop are now CONTROL class, so they are no longer dropped under video pressure. There is still no mirrorId/epoch, no ACK and no MirrorReady handshake. |
+| **D. Decoder failures not reported to the Controller** | **Not done.** |
+| **E. Surface lifecycle modelling** | **Not done.** |
+| **F. Oversized encoded frames (192 KiB cap)** | **Not done.** A keyframe over the cap still throws `PAYLOAD_TOO_LARGE` and closes the session. |
+| **G. Inbound `DROP_OLDEST` shared by control and media** | **Not done.** `RelayEngine._messages` is still one `MutableSharedFlow(extraBufferCapacity = 32, DROP_OLDEST)`. |
+| **H. Mirror health protocol** | **Not done.** |
+| **I. MediaProjection service review** | **Not done.** |
+| **J. Codec robustness review** | **Not done.** |
+
 ## First two-device run
 
 Everything below was found by running the two phones against each other for the first time, not by

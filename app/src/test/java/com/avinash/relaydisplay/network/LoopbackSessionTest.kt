@@ -6,6 +6,8 @@ import com.avinash.relaydisplay.network.session.RelayError
 import com.avinash.relaydisplay.network.session.RelaySession
 import com.avinash.relaydisplay.network.session.SessionListener
 import com.avinash.relaydisplay.network.transport.LoopbackPair
+import com.avinash.relaydisplay.protocol.MirrorStop
+import com.avinash.relaydisplay.protocol.MirrorFrame
 import com.avinash.relaydisplay.network.transport.SecureConnection
 import com.avinash.relaydisplay.protocol.Capabilities
 import com.avinash.relaydisplay.protocol.Frame
@@ -371,5 +373,81 @@ class LoopbackSessionTest {
         assertTrue("silent peer should be dropped", events.closedLatch.await(5, TimeUnit.SECONDS))
         assertTrue(events.closedError.get() is RelayError.ConnectFailed)
         displayConn.close()
+    }
+
+    // -- media must never starve control (the one-minute mirror failure) ------------------
+
+    @Test
+    fun `a saturated media queue does not stop control messages getting through`() {
+        val (controllerConn, displayConn, outcomes) = handshakePair()
+        val controllerEvents = Recorder()
+        val displayEvents = Recorder()
+        val controllerSession = RelaySession(controllerConn, outcomes.first, controllerEvents, scope)
+        val displaySession = RelaySession(displayConn, outcomes.second, displayEvents, scope)
+        controllerSession.start()
+        displaySession.start()
+
+        // Far more frames than any queue holds, submitted as fast as the encoder callback would.
+        // Before the split this filled the single 8-slot channel that the heartbeat also used.
+        repeat(500) {
+            controllerSession.trySend(MirrorFrame(UUID.randomUUID(), it.toLong(), it == 0, ByteArray(2048)))
+        }
+
+        // A control message queued behind that flood must still arrive.
+        controllerSession.trySend(MirrorStop(UUID.randomUUID(), "user closed"))
+
+        var sawStop = false
+        val deadline = System.currentTimeMillis() + 10_000
+        while (System.currentTimeMillis() < deadline && !sawStop) {
+            val message = displayEvents.nextMessage(timeoutMs = 2_000) ?: break
+            if (message is MirrorStop) sawStop = true
+        }
+        assertTrue("MirrorStop must survive a flood of video frames", sawStop)
+
+        // And the session must still be alive: dropping video is normal, closing is not.
+        assertNull("a full media queue must not close a healthy session", controllerEvents.closedError.get())
+        assertNull(displayEvents.closedError.get())
+
+        val metrics = controllerSession.metrics()
+        assertTrue(
+            "the media queue should have dropped frames rather than blocking, got $metrics",
+            metrics.mediaDropped > 0,
+        )
+
+        controllerSession.close()
+        displaySession.close()
+    }
+
+    @Test
+    fun `the heartbeat survives continuous frame traffic`() {
+        val (controllerConn, displayConn, outcomes) = handshakePair()
+        val controllerEvents = Recorder()
+        val displayEvents = Recorder()
+        // A 200 ms heartbeat so the test exercises several intervals in a couple of seconds; the
+        // production interval is 15 s, which is what made the original bug take about a minute.
+        val controllerSession = RelaySession(
+            controllerConn, outcomes.first, controllerEvents, scope, heartbeatIntervalMs = 200,
+        )
+        val displaySession = RelaySession(displayConn, outcomes.second, displayEvents, scope)
+        controllerSession.start()
+        displaySession.start()
+
+        val stop = System.currentTimeMillis() + 3_000
+        var frames = 0
+        while (System.currentTimeMillis() < stop) {
+            controllerSession.trySend(
+                MirrorFrame(UUID.randomUUID(), frames.toLong(), frames % 24 == 0, ByteArray(4096)),
+            )
+            frames++
+        }
+
+        assertNull(
+            "continuous video must not close the session -- this is the reported failure",
+            controllerEvents.closedError.get(),
+        )
+        assertTrue("expected real load, only sent $frames frames", frames > 100)
+
+        controllerSession.close()
+        displaySession.close()
     }
 }
