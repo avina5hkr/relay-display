@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Networking. INTERNET is needed for any socket at all, even a purely local one; the app
+      never contacts a server on the internet. ACCESS_NETWORK_STATE drives the connectivity
+      callbacks that replace polling, and ACCESS_WIFI_STATE lets us report the transport.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Held only while mDNS discovery or advertising is actually running, then released. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!--
+      Android 17 (API 37) gates local network access behind a runtime permission. Declaring it
+      is harmless on older releases, which simply ignore an unknown permission name; the runtime
+      request is made only on API 37+ (see PermissionPolicy).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <!-- Foreground service for Always Ready and for an active connected session. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- Runtime on API 33+. Denial degrades the ongoing notification, it does not block a session. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Requested only when the user taps Scan on the pairing screen. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.autofocus"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="false" />
+
+    <application
+        android:name=".app.RelayApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.RelayDisplay"
+        tools:targetApi="34">
+
+        <!--
+          The only exported component. It is the launcher entry point and the share target, so
+          every intent that reaches it is treated as untrusted input and validated before use.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.RelayDisplay"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              Share target. Text only: a shared file's URI grant lives and dies with its intent,
+              and the send flow uses the Storage Access Framework instead, which keeps the read
+              window under this app's control.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Keeps a live local-network session alive while the app is not in the foreground.
+          connectedDevice is the matching type: this is an ongoing connection to a nearby
+          external device over the local network.
+        -->
+        <service
+            android:name=".service.RelayConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!--
+          Holds screen capture, and only that. Separate from the connection service so stopping
+          the mirror never disturbs the session, and so the mediaProjection type is only ever
+          claimed while a projection actually exists.
+        -->
+        <service
+            android:name=".service.MirrorProjectionService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+    </application>
+
+</manifest>

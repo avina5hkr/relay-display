@@ -1,0 +1,25 @@
+# R8 keep rules for RelayDisplay.
+#
+# The app uses no reflection of its own: the wire protocol is a hand-written binary codec, and
+# there is no JSON or annotation-driven serialization anywhere. So there is very little to keep,
+# and each rule below exists for a named reason rather than "just in case".
+
+# ZXing reads its own enum constants by name in a couple of places (EncodeHintType,
+# DecodeHintType, ErrorCorrectionLevel). Keeping enum accessors is the standard, minimal fix and
+# is far narrower than keeping the whole library.
+-keepclassmembers enum com.google.zxing.** {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+# Kotlin sealed hierarchies used in `when` do not need keeping, but the protocol enums are
+# compared by name in diagnostics output, which must stay readable in a shared report.
+-keepclassmembers enum com.avinash.relaydisplay.protocol.ProtocolErrorCode {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+# Keep the line numbers so a stack trace in an exported diagnostics report is actionable, while
+# still allowing everything else to be renamed.
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

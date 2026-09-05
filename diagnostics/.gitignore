@@ -1,0 +1,4 @@
+# Device-specific capture output. Never committed, never packaged.
+logs/
+*.log
+*.txt

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup is disabled outright (android:allowBackup="false"), and these rules document why in
+  case it is ever re-enabled.
+
+  The device identity lives in the Android Keystore and is not exportable, so restoring the
+  preferences onto a different phone would leave a pinned peer fingerprint whose private half no
+  longer exists: the app would look paired and then fail every handshake. Received content is
+  cached and is not the user's to lose.
+-->
+<full-backup-content>
+    <exclude domain="file" path="datastore/" />
+    <exclude domain="file" path="relay_cache/" />
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>
