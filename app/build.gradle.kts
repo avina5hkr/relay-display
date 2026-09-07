@@ -8,7 +8,25 @@ plugins {
 // -------------------------------------------------------------------------------------------
 
 val appVersionName: String = providers.gradleProperty("APP_VERSION_NAME").get()
-val appVersionCode: Int = providers.gradleProperty("APP_VERSION_CODE").get().toInt()
+
+/**
+ * versionCode, parsed with an intentional error message.
+ *
+ * A raw `.toInt()` gave a bare NumberFormatException pointing at Gradle internals. Passing a
+ * sentinel through to AGP was worse: AGP reports "versionCode is set to -1" while the file
+ * actually says something like `1.0`, which sends you looking in the wrong place.
+ *
+ * So this fails configuration immediately, naming the property and the offending value. An
+ * unparsable versionCode cannot produce a working build in any case, and this only affects a
+ * genuinely broken gradle.properties -- a normal checkout, with or without signing credentials,
+ * configures and syncs exactly as before.
+ */
+val rawVersionCode: String = providers.gradleProperty("APP_VERSION_CODE").get()
+val appVersionCode: Int = rawVersionCode.trim().toIntOrNull()
+    ?: throw GradleException(
+        "APP_VERSION_CODE in gradle.properties must be a positive integer, but is " +
+            "'${rawVersionCode.trim()}'.",
+    )
 
 /**
  * Semantic version, optionally with a dotted prerelease suffix: 1.0.0 or 0.1.0-beta.1.
@@ -31,14 +49,20 @@ val validateVersion = tasks.register("validateVersion") {
     // object reference.
     val name = appVersionName
     val code = appVersionCode
+    val rawCode = rawVersionCode
     val pattern = semVerPattern
     inputs.property("versionName", name)
-    inputs.property("versionCode", code)
+    inputs.property("versionCode", rawCode)
     doLast {
         if (!Regex(pattern).matches(name)) {
             throw GradleException(
                 "APP_VERSION_NAME '$name' is not a semantic version. " +
                     "Expected 1.0.0 or 0.1.0-beta.1.",
+            )
+        }
+        if (rawCode.trim().toIntOrNull() == null) {
+            throw GradleException(
+                "APP_VERSION_CODE in gradle.properties is not an integer: '$rawCode'.",
             )
         }
         if (code < 1) {
@@ -367,11 +391,79 @@ val requireReleaseSigning = tasks.register("requireReleaseSigning") {
     }
 }
 
-// Every release artefact goes through both gates. Debug builds, unit tests, lint and Gradle sync
-// are untouched, so day-to-day work needs no credentials at all.
-listOf("assembleRelease", "bundleRelease").forEach { name ->
-    tasks.matching { it.name == name }.configureEach {
-        dependsOn(validateVersion, requireReleaseSigning)
+/**
+ * Every task that can emit a release APK or AAB, not just the aggregate lifecycle tasks.
+ *
+ * Guarding only `assembleRelease` and `bundleRelease` was bypassable, and demonstrably so:
+ * `./gradlew packageRelease` with no credentials produced `app-release-unsigned.apk`, and
+ * `./gradlew signReleaseBundle` produced an `.aab`. Both skipped the guard because it hung off
+ * the aggregate task rather than the one doing the work.
+ *
+ * This is task-name matching, which AGP does not officially bless. It is used because AGP 9.4
+ * exposes no public API for adding a dependency to the variant packaging or bundle-signing tasks
+ * -- `androidComponents.onVariants` can read and transform artifacts but cannot inject a
+ * precondition into `packageRelease`. Since the list is hand-maintained, `verifyReleaseGuards`
+ * below fails if AGP ever creates a release-artifact task that is not in it, so a toolchain
+ * upgrade cannot silently reopen the hole.
+ */
+val guardedReleaseTasks = setOf(
+    "assembleRelease",              // lifecycle: APK
+    "bundleRelease",                // lifecycle: AAB
+    "packageRelease",               // produces the release APK
+    "packageReleaseBundle",         // produces the release AAB
+    "signReleaseBundle",            // signs the AAB
+    "packageReleaseUniversalApk",   // universal APK from the bundle
+    "makeApkFromBundleForRelease",  // APKs extracted from the bundle
+)
+
+tasks.matching { it.name in guardedReleaseTasks }.configureEach {
+    dependsOn(validateVersion, requireReleaseSigning)
+}
+
+/**
+ * Fails if AGP creates a release-artifact task that [guardedReleaseTasks] does not cover.
+ *
+ * The pattern is deliberately broad and then filtered by an explicit allow-list of tasks known
+ * not to emit a distributable artifact, so a genuinely new packaging task shows up as a failure
+ * rather than as silence.
+ */
+tasks.register("verifyReleaseGuards") {
+    group = "verification"
+    description = "Checks that every release-artifact task carries the signing guard."
+    val guarded = guardedReleaseTasks
+    val candidates = provider {
+        tasks.names.filter { name ->
+            name.contains("Release") &&
+                (
+                    name.startsWith("package") ||
+                        name.startsWith("sign") ||
+                        name.startsWith("makeApkFromBundle") ||
+                        name.startsWith("assemble") ||
+                        name.startsWith("bundle")
+                    )
+        }
+    }
+    // Tasks that carry "Release" and a packaging-ish prefix but produce intermediates, not
+    // distributable artifacts. Listed explicitly so the check stays meaningful.
+    val knownNonArtifact = setOf(
+        "packageReleaseResources",
+        "bundleReleaseResources",
+        "bundleReleaseClassesToCompileJar",
+        "bundleReleaseClassesToRuntimeJar",
+        "signingConfigWriterRelease",
+    )
+    doLast {
+        val unguarded = candidates.get()
+            .filterNot { it in guarded || it in knownNonArtifact }
+            .sorted()
+        if (unguarded.isNotEmpty()) {
+            throw GradleException(
+                "These release tasks are not covered by the signing guard: " +
+                    "${unguarded.joinToString(", ")}. Add them to guardedReleaseTasks (or to " +
+                    "knownNonArtifact if they cannot emit a distributable artifact).",
+            )
+        }
+        logger.lifecycle("All ${guarded.size} release-artifact tasks carry the signing guard.")
     }
 }
 
