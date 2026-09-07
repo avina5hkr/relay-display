@@ -83,14 +83,14 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Upload unsigned debug APK (manual runs only)
-        # Only on workflow_dispatch, and named so nobody mistakes it for a release build. It is
+      - name: Upload debug APK (manual runs only)
+        # Only on workflow_dispatch, and named so nobody mistakes it for a release build. It IS
         # signed with the debug key and must never be distributed.
         if: github.event_name == 'workflow_dispatch'
         # actions/upload-artifact v7.0.1
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: DEBUG-UNSIGNED-NOT-FOR-DISTRIBUTION-${{ github.run_id }}
+          name: DEBUG-SIGNED-NOT-FOR-DISTRIBUTION-${{ github.run_id }}
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 7
           if-no-files-found: error
