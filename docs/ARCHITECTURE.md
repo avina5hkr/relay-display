@@ -142,6 +142,28 @@ remote screen.** Sending content sets `SENDING`/`SENT`; only a report from the D
 Failed, because "I put it on the wire" and "the other phone drew it" are genuinely different
 facts and the old UI conflated them.
 
+### Generic file transfer
+
+Separated along the lines the feature actually has, so no single class owns both a stream and a
+policy decision:
+
+| Concern | Where |
+| --- | --- |
+| Limits, metadata and batch validation, executable warning | `content/FileTransferPolicy.kt` (pure, no Android) |
+| Batch and per-file phases | `content/FileBatchState.kt` (pure, no Android) |
+| Untrusted filenames | `content/FilenameSanitizer` in `UrlValidation.kt` |
+| Receiver stream lifecycle, digest, atomic promote | `content/TransferReceiver.kt` (existing, extended) |
+| Temporary and promoted file storage | `content/ContentCache.kt` (existing) |
+| Protocol serialisation | `protocol/MessageCodec.kt` (existing) |
+| Handing a file to another app | `FileProvider`, scoped by `res/xml/file_provider_paths.xml` |
+
+`FileTransferPolicy` and `FileBatchState` have no Android dependency at all, which is why the
+security-critical rules run in milliseconds on the JVM instead of needing a device.
+
+File chunks are intended to travel on the existing `TrafficClass.BULK` queue — backpressured
+rather than lossy, and ranked below `CONTROL` — so a transfer cannot starve heartbeats the way
+video once did. **That routing is not yet wired**; see `docs/IMPLEMENTATION_STATUS.md`.
+
 ### Outbound traffic classes
 
 One connection carries video, control and bulk transfer. They must not share a queue.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What the FileProvider is allowed to expose.
+
+  Only the two cache subdirectories the transfer code writes, never the whole cache and never
+  external storage. A FileProvider rooted at "." would let any path traversal that got past the
+  filename sanitiser turn into a readable URI for arbitrary app-private data, so the root is kept
+  as narrow as the feature allows.
+
+  Names must match ContentCache's directory layout.
+-->
+<paths>
+    <!-- Verified, complete files, ready to open or share. -->
+    <cache-path name="received" path="ready/" />
+    <!-- In-flight partials. Exposed so a future resume can read one back; never shared onward. -->
+    <cache-path name="incoming" path="incoming/" />
+</paths>

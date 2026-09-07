@@ -95,7 +95,15 @@ object FilenameSanitizer {
     const val MAX_LENGTH = 120
     private const val FALLBACK = "received-file"
 
-    fun sanitize(raw: String): String {
+    fun sanitize(raw: String): String = clean(raw).take(MAX_LENGTH)
+
+    /**
+     * Sanitises without any length cap.
+     *
+     * Split out because [sanitize] truncates by characters and drops the extension when it does,
+     * so a byte-limited caller must start from the untruncated name or it can never preserve one.
+     */
+    private fun clean(raw: String): String {
         // Take the last segment first, so "../../etc/passwd" reduces to "passwd" before anything
         // else looks at it.
         val lastSegment = raw.substringAfterLast('/').substringAfterLast('\\')
@@ -113,7 +121,57 @@ object FilenameSanitizer {
         if (cleaned in RESERVED || cleaned.substringBefore('.').uppercase() in RESERVED) {
             return "$FALLBACK-$cleaned"
         }
-        return cleaned.take(MAX_LENGTH)
+        return cleaned
+    }
+
+    /**
+     * Sanitises, then truncates to a **byte** budget rather than a character count.
+     *
+     * [sanitize] caps at [MAX_LENGTH] characters, which is not the same thing: the wire field and
+     * most filesystems bound bytes, and one emoji or CJK character is three to four bytes, so a
+     * 120-character name can be 480 bytes and overflow a 255-byte field.
+     *
+     * Two details that are easy to get wrong and are covered by tests:
+     *  - truncation walks **code points**, not `Char`s. Dropping UTF-16 code units splits
+     *    surrogate pairs and produces a string that cannot be re-encoded.
+     *  - the extension is preserved where it fits, because it is the only hint about what the
+     *    file is once the stem has been cut.
+     */
+    fun sanitizeToByteLimit(raw: String, maxBytes: Int): String {
+        val cleaned = clean(raw)
+        if (cleaned.utf8Size() <= maxBytes) return cleaned.take(MAX_LENGTH).ifEmpty { FALLBACK }
+
+        val extension = cleaned.substringAfterLast('.', "")
+        val suffix = if (extension.isNotEmpty() && extension.length <= 16) ".$extension" else ""
+        val stem = if (suffix.isEmpty()) cleaned else cleaned.dropLast(suffix.length)
+
+        // Try to keep the extension. If even that does not fit, fall through to a bare stem.
+        val withSuffix = truncateToBytes(stem, maxBytes - suffix.utf8Size()) + suffix
+        if (withSuffix.utf8Size() <= maxBytes && withSuffix != suffix) return withSuffix
+
+        return truncateToBytes(cleaned, maxBytes).ifEmpty { FALLBACK.take(maxBytes) }
+    }
+
+    private fun String.utf8Size(): Int = toByteArray(Charsets.UTF_8).size
+
+    /** Keeps whole code points only, so the result always re-encodes cleanly. */
+    private fun truncateToBytes(value: String, maxBytes: Int): String {
+        if (maxBytes <= 0) return ""
+        if (value.utf8Size() <= maxBytes) return value
+        val kept = StringBuilder()
+        var used = 0
+        var index = 0
+        while (index < value.length) {
+            val codePoint = value.codePointAt(index)
+            val charCount = Character.charCount(codePoint)
+            val piece = value.substring(index, index + charCount)
+            val width = piece.utf8Size()
+            if (used + width > maxBytes) break
+            kept.append(piece)
+            used += width
+            index += charCount
+        }
+        return kept.toString()
     }
 
     /**

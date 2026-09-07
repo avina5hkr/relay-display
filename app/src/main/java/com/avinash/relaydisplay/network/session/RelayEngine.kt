@@ -733,6 +733,10 @@ class RelayEngine(
         Capabilities.LINK,
         Capabilities.IMAGE,
         Capabilities.PDF,
+        // The display is the side that receives generic files, so it is the side that announces
+        // the capability. A controller checks for this before offering a file batch and tells the
+        // user plainly when the peer is too old, rather than streaming a kind it cannot parse.
+        Capabilities.FILE_V1,
         Capabilities.MIRROR_RECEIVE,
     )
 

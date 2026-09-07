@@ -69,6 +69,15 @@ enum class PresentationRotation(val degrees: Int, val wireCode: Int) {
 enum class ContentKind(val wireCode: Int) {
     IMAGE(1),
     PDF(2),
+
+    /**
+     * A generic file: whatever the document picker offered, kept as opaque bytes.
+     *
+     * Unlike [IMAGE] and [PDF] the app never decodes or renders these, so any MIME type is
+     * acceptable. Wire code 3 is permanent; a peer that does not announce the `file-v1`
+     * capability is told so explicitly rather than being sent a kind it cannot interpret.
+     */
+    FILE(3),
     ;
 
     companion object {

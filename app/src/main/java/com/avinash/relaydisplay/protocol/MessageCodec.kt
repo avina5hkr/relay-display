@@ -473,6 +473,15 @@ object Capabilities {
     const val LINK = "link"
     const val IMAGE = "image"
     const val PDF = "pdf"
+
+    /**
+     * Generic file transfer, wire version 1.
+     *
+     * Versioned in the string itself, so a future incompatible format announces `file-v2` and an
+     * older peer simply does not match it. That is what lets the sender say "this needs a newer
+     * Relay Display" instead of streaming a format the receiver will mis-parse.
+     */
+    const val FILE_V1 = "file-v1"
     const val MIRROR_RECEIVE = "mirror-rx"
     const val MIRROR_SEND = "mirror-tx"
 }

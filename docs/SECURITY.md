@@ -161,3 +161,69 @@ Every item in the specification's section 19 was reviewed. The table above recor
 and whether it has an automated test. Items with no automated test — MediaProjection lifecycle,
 exported-component behaviour, notification content — were reviewed by reading the code and the
 manifest, and are listed as manual checks in `docs/TESTING.md`.
+
+## Receiving arbitrary files
+
+Generic file transfer widens what a peer can send from "an image or a PDF" to "any bytes with any
+name and any declared type". The peer is authenticated, not trusted: pairing proves which phone is
+talking, never that the software on it is behaving.
+
+### Malicious filenames
+
+A received name is untrusted input that ends up labelling a file and, if mishandled, choosing
+where it is written. `FilenameSanitizer` reduces a name to its last path segment before anything
+else looks at it, so `../../etc/passwd` becomes `passwd`; strips control characters; replaces
+filesystem-hostile characters; defuses Windows device names, which matter because a received name
+may be shared onward to a desktop; and preserves spaces and Unicode, because mangling those is a
+bug rather than a defence.
+
+The name is never used to build a path in any case. A promoted file is named from its transfer
+UUID, and the sanitised name is only a label. `ReceivedFilenameTest` asserts that no sanitised
+name can contain a separator, across a list of hostile inputs.
+
+Truncation is by **bytes** and walks whole code points. A 120-character CJK name is 360 bytes and
+would overflow a 255-byte field; a byte-wise cut would split a surrogate pair and produce a string
+that cannot be re-encoded.
+
+### Oversized input and storage exhaustion
+
+Every limit above is checked before allocation. A file over the limit is refused at the offer, so
+nothing is opened. Overflow beyond the declared size is refused mid-stream rather than written.
+Free space plus headroom is validated before acceptance. Batch totals bound what a single accept
+can cost, and the pending-bytes and pending-files caps bound what repeated accepted batches can
+cost — without those, each batch could be individually legal while together filling the partition.
+
+### MIME spoofing
+
+Content sniffing is deliberately **not** applied to generic files, and this is a considered
+trade rather than an omission. Sniffing protects `IMAGE` and `PDF` because the app is about to
+point a decoder at those bytes. Nothing decodes a generic file, so sniffing could not prevent
+anything, while it would reject most ordinary files.
+
+Spoofing is instead handled where it matters: at open time. The app never installs or executes
+anything. Opening always goes through an Android chooser with the user selecting the handler, and
+`FileTransferPolicy.requiresOpenWarning` checks **both** the declared MIME and the file extension
+before that, because either can be wrong alone — a provider may report `application/octet-stream`
+for an APK, and a sender may declare `text/plain` for something named `payload.apk`.
+
+### Untrusted receiving applications
+
+Open and Share hand the file to another app through a `FileProvider` content URI with a temporary
+read grant, never a `file://` URI. The provider is `exported="false"` with
+`grantUriPermissions="true"`, so it is unreachable except through a URI this app explicitly grants.
+Its `file_provider_paths.xml` is scoped to the two cache subdirectories the transfer code writes,
+not the whole cache and not external storage: a provider rooted at `.` would turn any traversal
+that got past the sanitiser into a readable URI for arbitrary app-private data.
+
+### Partial-file cleanup
+
+Bytes land in app-private cache under a temporary name and are promoted only after every chunk
+arrived in order, the byte count matched, the SHA-256 matched, and the stream flushed and closed.
+A digest mismatch, cancellation, truncation or disconnect deletes the partial;
+`GenericFileReceiveTest` asserts nothing is promoted and no partial survives on each of those
+paths. Unclaimed files expire after 24 hours.
+
+### No new permissions
+
+Selection is through the Storage Access Framework. No storage permission is requested, and
+`MANAGE_EXTERNAL_STORAGE` is neither declared nor needed.

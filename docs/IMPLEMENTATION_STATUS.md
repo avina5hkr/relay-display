@@ -128,6 +128,44 @@ Last updated after the Milestone 8 build.
 | Two-device regression matrix | **Blocked** | needs both phones attached and unlocked at once |
 | Mirroring verified on hardware | **Partial** | reported working by the user; not re-verified after these changes |
 
+## Generic file transfer
+
+**Protocol and security core: implemented and unit-tested. UI: not implemented.** Split
+deliberately rather than half-building both, so nothing here is a facade over missing behaviour.
+
+| Piece | State |
+| --- | --- |
+| `ContentKind.FILE` wire code 3 | Done |
+| `file-v1` capability, announced by the display | Done |
+| "Peer too old" refusal path | Done, unit-tested. Not exercised against a real old peer, because none exists — no version has been published. |
+| Any MIME accepted for `FILE`; sniffing correctly not applied | Done |
+| Empty files, kind-aware | Done. Zero bytes is valid for `FILE`, still invalid for `IMAGE`/`PDF`. |
+| Filename sanitising, byte-limited, code-point safe | Done |
+| Metadata and batch validation, all limits | Done |
+| Multi-file batch state machine | Done |
+| `FileProvider`, narrowly scoped | Registered, **never exercised at runtime** |
+| Streaming, digest, ordered chunks, atomic promote | Reuses the existing `TransferReceiver`; extended and tested for `FILE` |
+| **Files tile, picker, review sheet** | **Not implemented** |
+| **Incoming-batch prompt, accept/reject** | **Not implemented** |
+| **Progress UI on either device** | **Not implemented** |
+| **Open / Save as / Share / Delete actions** | **Not implemented** |
+| **Auto-accept setting** | **Not implemented** |
+| **Foreground-service integration, notification progress** | **Not implemented** |
+| **Sender stream lifecycle (reading content URIs)** | **Not implemented** |
+| Instrumentation tests for the above | Not written, because there is no UI to drive |
+| Two-device matrix | **Not run.** No device was attached, and there is no end-to-end path to run yet. |
+
+Nothing in the app currently offers a way to send a generic file: the tile does not exist. What
+exists is the protocol, the validation, the state machine and the storage plumbing, with 74 unit
+tests, so the risky half is settled before any UI is built on it.
+
+### Mirroring interaction
+
+**Not implemented and not tested.** The policy is chosen but unenforced: file chunks belong in the
+existing `TrafficClass.BULK` queue, which is backpressured and already ranks below `CONTROL`, so
+heartbeats cannot be starved by a transfer the way they were by video. That reuse is the intended
+design; no code routes file chunks yet, and no concurrent mirroring test has been run.
+
 ## Mirroring reliability (Phase 2)
 
 Diagnosed from code, fixed, and covered by tests. **Not hardware-verified: no device was attached

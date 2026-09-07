@@ -60,7 +60,14 @@ class TransferReceiver(private val cache: ContentCache) {
 
     /** Decides whether an offer can be accepted at all. Nothing is opened until it is. */
     fun evaluate(offer: ContentOffer): TransferOutcome {
-        if (offer.sizeBytes <= 0) {
+        if (offer.sizeBytes < 0) {
+            return TransferOutcome.Rejected(ProtocolErrorCode.MALFORMED_FRAME, "negative size")
+        }
+        // Zero bytes is kind-dependent, not universally good or bad. An empty generic file is an
+        // ordinary thing to send and refusing it made an empty .txt look like a protocol error.
+        // An empty image or PDF is genuinely invalid: there is nothing for a decoder to open, so
+        // accepting it would only defer the failure to the presentation screen.
+        if (offer.sizeBytes == 0L && offer.kind != ContentKind.FILE) {
             return TransferOutcome.Rejected(ProtocolErrorCode.MALFORMED_FRAME, "empty transfer")
         }
         if (offer.sizeBytes > ContentLimits.MAX_FILE_BYTES) {
@@ -201,14 +208,28 @@ object MimeSupport {
     fun isSupported(kind: ContentKind, mimeType: String): Boolean = when (kind) {
         ContentKind.IMAGE -> mimeType.lowercase() in IMAGE_TYPES
         ContentKind.PDF -> mimeType.lowercase() in PDF_TYPES
+        // A generic file is never decoded or rendered, only stored and handed to a chooser, so
+        // any MIME type is acceptable. The type is still length- and control-character checked by
+        // FileTransferPolicy.validateFileMetadata before it reaches here.
+        ContentKind.FILE -> true
     }
 
-    /** Whether sniffed content actually belongs to the kind the sender claimed. */
+    /**
+     * Whether sniffed content actually belongs to the kind the sender claimed.
+     *
+     * For IMAGE and PDF this is a real defence: the app is about to point a decoder at the bytes,
+     * so they had better be the format claimed. For FILE nothing decodes the content, so content
+     * sniffing cannot prevent anything and would only reject legitimate files whose leading bytes
+     * this app does not recognise -- which is most files. MIME spoofing is instead handled where
+     * it actually matters: at open time, via FileTransferPolicy.requiresOpenWarning and an
+     * explicit chooser.
+     */
     fun matchesKind(kind: ContentKind, sniffed: SniffedType): Boolean = when (kind) {
         ContentKind.IMAGE -> sniffed in setOf(
             SniffedType.JPEG, SniffedType.PNG, SniffedType.WEBP, SniffedType.GIF, SniffedType.HEIF,
         )
         ContentKind.PDF -> sniffed == SniffedType.PDF
+        ContentKind.FILE -> true
     }
 
     fun extensionFor(sniffed: SniffedType): String? = when (sniffed) {

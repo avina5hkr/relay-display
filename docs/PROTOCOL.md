@@ -180,6 +180,48 @@ Receiver rules, all enforced in `TransferReceiver`:
 The final name comes from the transfer UUID. The peer's display name is sanitized and used only
 as a label.
 
+## Generic file transfer (capability `file-v1`)
+
+Added alongside the existing image and PDF transfer, reusing the same
+`CONTENT_OFFER / TRANSFER_START / TRANSFER_CHUNK / TRANSFER_COMPLETE` sequence rather than
+introducing a second mechanism. Only three things are new.
+
+**`ContentKind.FILE` = wire code 3.** Permanent, like the other codes. Unlike `IMAGE` and `PDF`
+the receiver never decodes these bytes, so any MIME type is accepted and content sniffing is not
+applied — sniffing cannot protect something nothing parses, and would reject most ordinary files
+whose leading bytes this app does not recognise.
+
+**Version lives in the capability string.** A display announces `file-v1` in its HELLO
+capabilities. A controller checks for it before offering a file batch and, if it is absent, tells
+the user that file transfer needs a newer Relay Display on the other phone. Nothing is sent. A
+future incompatible format announces `file-v2`, which an older peer simply will not match, so an
+old build keeps failing cleanly rather than half-parsing a newer wire format.
+
+**Zero-byte files are accepted for `FILE` only.** An empty generic file is ordinary; an empty
+image or PDF is not, because there is nothing for a decoder to open. The offer gate is therefore
+kind-aware rather than uniformly permissive.
+
+### Limits
+
+Enforced by `FileTransferPolicy` before anything is allocated, opened or written.
+
+| Limit | Value |
+| --- | ---: |
+| Files per batch | 20 |
+| Single file | 50 MiB (shared with image/PDF) |
+| Batch total, known sizes | 200 MiB |
+| Receiver pending bytes | 400 MiB |
+| Receiver pending files | 60 |
+| Chunk | 64 KiB (existing `CHUNK_BYTES`) |
+| Filename | 255 bytes, truncated by **bytes**, whole code points only |
+| MIME string | 128 bytes, no control characters |
+| Pending-file expiry | 24 h |
+| Inactivity timeout | 30 s |
+
+A declared size of `-1` means "unknown", which a content provider is entitled to report. Any
+other negative value is `MALFORMED_FRAME`. Unknown sizes do not contribute to the batch total and
+are bounded per-file while streaming instead.
+
 ## Versioning and compatibility
 
 - A different `versionMajor` is rejected at the frame layer.

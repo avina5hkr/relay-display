@@ -86,6 +86,26 @@
           connectedDevice is the matching type: this is an ongoing connection to a nearby
           external device over the local network.
         -->
+        <!--
+          Grants temporary read access to a received file so Open and Share can hand it to another
+          app. A raw file:// URI would throw FileUriExposedException on API 24+ and, worse, would
+          hand out a filesystem path; a content:// URI from here is scoped to one file and one
+          grant.
+        
+          exported="false" with grantUriPermissions="true" is the required pair: the provider
+          itself is unreachable by other apps, and access happens only through a URI this app
+          explicitly grants in an Intent.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
+
         <service
             android:name=".service.RelayConnectionService"
             android:exported="false"

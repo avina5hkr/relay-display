@@ -54,6 +54,25 @@ Three suites were added this round, each pinning a bug the two-device run found:
 contract `RelayEngine.stop()` depends on, and four more `ConnectionStateMachineTest` cases for
 `PeerDisconnected`.
 
+### Generic file transfer
+
+| Suite | Tests | Covers |
+| --- | ---: | --- |
+| `FileTransferPolicyTest` | 21 | known/unknown/negative/zero sizes, per-file and batch limits at and over the boundary, MIME fallback, over-long and control-character MIME, unknown sizes excluded from batch totals, executable warning by MIME **and** extension including a mismatched declaration, case-insensitivity, image/PDF rules unchanged |
+| `ReceivedFilenameTest` | 15 | traversal (relative, absolute, Windows, traversal-only), no separator survives any hostile input, control characters, hostile characters, Windows device names, spaces/CJK/Cyrillic/emoji preserved, byte-limited truncation, truncation never splitting a code point |
+| `FileBatchStateTest` | 19 | initial state, known vs indeterminate totals, progress across files, percentage clamping, empty file as 100%, settling only when every phase is terminal, verifying not terminal, cancel keeping completed files, idempotent cancel, rejection, retryable vs non-retryable failure, no retry before settling, disconnect marking interrupted, retry-from-start resetting only the retried file |
+| `GenericFileReceiveTest` | 19 | end-to-end accept/verify/promote, any MIME, empty file, APK transferred but flagged, digest mismatch, out-of-order chunk, duplicate chunk index, wrong transfer id, truncated finish, overflow beyond declared size, size limit, negative size, chunk size beyond the frame limit, size changed between offer and start, cancellation cleanup, hostile filename, capability versioning, old-peer refusal |
+
+**74 new tests, 418 total, 0 failures.**
+
+Not covered, because the code does not exist yet: picker and multi-select result handling,
+selection review, incoming prompt, accept/reject, progress and cancellation UI, completed-file
+actions, no-handler error on open, back/close behaviour. No instrumentation test was added for
+file transfer for the same reason — there is nothing to drive.
+
+**No two-device file-transfer test has been run.** No device was attached, and there is no
+end-to-end path to exercise: nothing in the app offers a way to select a file.
+
 ### Fault injection
 
 `LoopbackSessionTest` uses `LoopbackPair`, a pair of `RelayLink`s joined by a bounded byte pipe.

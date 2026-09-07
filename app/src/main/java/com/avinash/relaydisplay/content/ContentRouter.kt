@@ -402,6 +402,10 @@ class ContentRouter(
         val finished = completed[message.transferId] ?: return null
         presentation.updateOptions { it.copy(fitMode = message.fitMode) }
         return when (message.kind) {
+            // A generic file is not a presentation: nothing is drawn on the companion's screen
+            // for it. It lands in the received-files list instead, which is why there is no
+            // presentation snapshot to return here.
+            ContentKind.FILE -> null
             ContentKind.IMAGE -> presentation.showImage(
                 currentSession, message.envelope, message.transferId, finished.file, finished.displayName,
             )
