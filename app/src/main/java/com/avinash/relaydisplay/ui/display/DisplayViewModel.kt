@@ -16,6 +16,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import com.avinash.relaydisplay.content.ContentRouter
+import com.avinash.relaydisplay.content.IncomingBatch
+import com.avinash.relaydisplay.content.ReceivedFile
 
 data class DisplayUiState(
     val settings: RelaySettings = RelaySettings(),
@@ -23,6 +26,10 @@ data class DisplayUiState(
     val trustedPeer: TrustedPeer? = null,
     val localAddress: String? = null,
     val networkLabel: String = "",
+    /** A batch of files the controller has offered, awaiting this user's decision. */
+    val incomingBatch: IncomingBatch? = null,
+    /** Files that arrived complete and verified, newest first. */
+    val receivedFiles: List<ReceivedFile> = emptyList(),
 ) {
     val paused: Boolean get() = settings.operatingMode == OperatingMode.PAUSED
     val available: Boolean get() = connection.isActive || connection.isConnected
@@ -33,21 +40,37 @@ class DisplayViewModel(
     trustedPeerRepository: TrustedPeerRepository,
     private val sessionCoordinator: SessionCoordinator,
     private val platform: AndroidPlatformCapabilities,
+    private val router: ContentRouter,
 ) : ViewModel() {
 
     val uiState: StateFlow<DisplayUiState> = combine(
         settingsRepository.settings,
         sessionCoordinator.state,
         trustedPeerRepository.trustedPeer,
-    ) { settings, connection, peer ->
+        router.incomingBatch,
+        router.receivedFiles,
+    ) { values ->
         DisplayUiState(
-            settings = settings,
-            connection = connection,
-            trustedPeer = peer,
+            settings = values[0] as RelaySettings,
+            connection = values[1] as ConnectionState,
+            trustedPeer = values[2] as TrustedPeer?,
             localAddress = AndroidPlatformCapabilities.localIpv4Address(),
             networkLabel = platform.activeTransportLabel(),
+            incomingBatch = values[3] as IncomingBatch?,
+            receivedFiles = @Suppress("UNCHECKED_CAST") (values[4] as List<ReceivedFile>),
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DisplayUiState())
+
+    init {
+        // The list is on disk, so it survives a restart and has to be read back rather than
+        // assumed empty.
+        router.refreshReceivedFiles()
+    }
+
+    fun acceptIncomingBatch() = router.acceptIncomingBatch()
+    fun rejectIncomingBatch() = router.rejectIncomingBatch()
+    fun deleteReceivedFile(transferId: java.util.UUID) = router.deleteReceivedFile(transferId)
+    fun refreshReceivedFiles() = router.refreshReceivedFiles()
 
     fun makeAvailable() = sessionCoordinator.requestSession()
     fun stopBeingAvailable() = sessionCoordinator.releaseSession()
@@ -65,6 +88,7 @@ class DisplayViewModel(
             trustedPeerRepository = container.trustedPeerRepository,
             sessionCoordinator = container.sessionCoordinator,
             platform = container.platformCapabilities,
+            router = container.contentRouter,
         )
     }
 }

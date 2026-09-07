@@ -49,6 +49,21 @@ enum class MessageType(val code: Int, val requiresSecureSession: Boolean) {
     SHOW_FILE(0x0047, true),
     PDF_PAGE_COMMAND(0x0048, true),
 
+    // --- generic file transfer (capability `file-v1`) ---
+    //
+    // A batch wraps the per-file CONTENT_OFFER/TRANSFER_* exchange above rather than replacing it:
+    // one confirmation for the whole selection, then each file streams through the machinery that
+    // already existed and is already tested. A peer that does not announce `file-v1` never sees
+    // any of these three.
+    /** Controller -> Display: "here is what I would like to send", for one confirmation. */
+    FILE_BATCH_OFFER(0x0049, true),
+
+    /** Display -> Controller: the user accepted the whole batch. */
+    FILE_BATCH_ACCEPT(0x004A, true),
+
+    /** Display -> Controller: the user rejected it, or it broke a limit. */
+    FILE_BATCH_REJECT(0x004B, true),
+
     // --- mirroring ---
     MIRROR_START(0x0050, true),
     MIRROR_CONFIG(0x0051, true),

@@ -91,7 +91,7 @@
           app. A raw file:// URI would throw FileUriExposedException on API 24+ and, worse, would
           hand out a filesystem path; a content:// URI from here is scoped to one file and one
           grant.
-        
+
           exported="false" with grantUriPermissions="true" is the required pair: the provider
           itself is unreachable by other apps, and access happens only through a URI this app
           explicitly grants in an Intent.

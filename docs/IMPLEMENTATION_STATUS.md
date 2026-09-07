@@ -130,41 +130,57 @@ Last updated after the Milestone 8 build.
 
 ## Generic file transfer
 
-**Protocol and security core: implemented and unit-tested. UI: not implemented.** Split
-deliberately rather than half-building both, so nothing here is a facade over missing behaviour.
+**End to end, reachable from the app, and exercised on two phones.** Controller: Samsung SM-S908E
+(API 36). Display: Lenovo K33a42 (API 24). That run found two real defects that no unit test could
+reach — a FileProvider path that never matched the cache layout, and a transfer completion that
+could overtake its own final chunks — both since fixed and covered by tests. See
+`docs/TESTING.md` for the full matrix and what is still unverified. States below are what is true,
+not what is intended.
 
 | Piece | State |
 | --- | --- |
-| `ContentKind.FILE` wire code 3 | Done |
-| `file-v1` capability, announced by the display | Done |
-| "Peer too old" refusal path | Done, unit-tested. Not exercised against a real old peer, because none exists — no version has been published. |
-| Any MIME accepted for `FILE`; sniffing correctly not applied | Done |
-| Empty files, kind-aware | Done. Zero bytes is valid for `FILE`, still invalid for `IMAGE`/`PDF`. |
-| Filename sanitising, byte-limited, code-point safe | Done |
-| Metadata and batch validation, all limits | Done |
-| Multi-file batch state machine | Done |
-| `FileProvider`, narrowly scoped | Registered, **never exercised at runtime** |
-| Streaming, digest, ordered chunks, atomic promote | Reuses the existing `TransferReceiver`; extended and tested for `FILE` |
-| **Files tile, picker, review sheet** | **Not implemented** |
-| **Incoming-batch prompt, accept/reject** | **Not implemented** |
-| **Progress UI on either device** | **Not implemented** |
-| **Open / Save as / Share / Delete actions** | **Not implemented** |
-| **Auto-accept setting** | **Not implemented** |
-| **Foreground-service integration, notification progress** | **Not implemented** |
-| **Sender stream lifecycle (reading content URIs)** | **Not implemented** |
-| Instrumentation tests for the above | Not written, because there is no UI to drive |
-| Two-device matrix | **Not run.** No device was attached, and there is no end-to-end path to run yet. |
+| `ContentKind.FILE` wire code 3 | **Complete** |
+| `file-v1` capability, announced by the display | **Complete** |
+| `FILE_BATCH_OFFER / ACCEPT / REJECT`, bounded nested manifest | **Complete**, 13 codec tests including truncated, over-long, trailing-byte and overflowing frames |
+| "Peer too old" refusal, used by production code | **Complete.** `sendFileBatch` checks `peerCapabilities` and the Send screen says so before the user picks anything. Not exercised against a real old peer, because none exists — no version has been published. |
+| Sizes measured before offering; no unknown-size sentinel on the wire | **Complete**, 12 tests. Replaces the old contradiction between the picker, this protocol and the receiver. |
+| Empty files, kind-aware | **Complete.** Zero bytes is valid for `FILE`, still invalid for `IMAGE`/`PDF`. |
+| Filename sanitising: byte **and** character limits, code-point safe, extension preserved | **Complete**, 22 tests including the ~180-character ASCII `.pdf` regression |
+| Metadata and batch validation, overflow-safe totals | **Complete** |
+| Multi-file batch state machine, wired to production | **Complete.** `ContentRouter.sendFileBatch` drives `FileBatchState`; the Send screen renders it. |
+| Files action, SAF multi-select, review list with remove/send/cancel | **Complete.** Reachable from a **Files** tile on the controller dashboard as well as the Send screen; both drive one `SendViewModel` keyed "send", so a batch started from either shows in both. |
+| Incoming-batch prompt: sender, count, names, sizes, Accept all / Reject | **Complete**, instrumentation-tested. Back and outside-tap both reject rather than leaving the sender waiting. |
+| Per-file progress, "N of M", cancel, retry-from-start | **Complete.** Retry re-offers only retryable failures and never resends a verified file. |
+| Received-files list with Open / Save as / Share / Delete | **Complete**, instrumentation-tested |
+| `FileProvider`, narrowed to verified files only | **Complete.** `incoming/` removed: partials are unverified, so no URI is ever granted to one. The declared path had never matched the cache layout, so the first real use crashed; fixed and pinned by `FileProviderPathTest`. |
+| Executable warning before opening; never auto-installs or executes | **Complete**, instrumentation-tested on both phones |
+| Metadata sidecar so the list survives a restart | **Complete**, 17 cache tests |
+| Retention limits actually enforced, and able to hold one legal batch | **Complete.** `ContentCache` takes its budgets from `FileTransferPolicy`; expiry is swept at startup. |
+| Streaming, digest, ordered chunks, atomic promote | **Complete.** Reuses `TransferReceiver`, extended and tested for `FILE`. |
+| File bodies on `TrafficClass.BULK`; control stays `CONTROL` | **Complete.** `TransferComplete` had to move to `BULK` too: on `CONTROL` it overtook its own final chunks and failed large transfers. `TransferCancel` stays on `CONTROL` deliberately. |
+| **Auto-accept setting** | **Deferred, deliberately.** See below. |
+| **Foreground-service integration, notification progress** | **Deferred.** A batch sent with the app in the background is bounded by the existing session lifetime; there is no notification showing batch progress. |
+| **Resume after process death** | **Not implemented.** The protocol has no resume, partials are deleted rather than continued, and nothing claims otherwise. |
+| Instrumentation tests | **48 of 48 passing on both phones** (Lenovo API 24 and S22 API 36), including 13 file-transfer UI tests and 4 FileProvider path tests. |
+| Two-device transfer matrix | **Run.** 21 cases pass, including a 0-byte file, a 180-character filename, a 19.9 MB APK, restart persistence, reconnect without re-pairing, and the executable warning. Share, mid-flight cancel, retry-after-failure, concurrent mirroring and the batch limits at their boundaries are **not** exercised. |
 
-Nothing in the app currently offers a way to send a generic file: the tile does not exist. What
-exists is the protocol, the validation, the state machine and the storage plumbing, with 74 unit
-tests, so the risky half is settled before any UI is built on it.
+### Auto-accept: deferred on purpose
+
+There is no setting to accept incoming files without being asked, and the confirmation cannot be
+turned off. This is a deliberate omission rather than missing work: the prompt is the only thing
+standing between a paired peer and arbitrary bytes on this phone's storage, and an auto-accept
+switch is exactly the setting a user enables once for convenience and then forgets. If it is added
+later it needs its own design — at minimum a per-peer scope, a size ceiling and an expiry — and
+none of that is built. Until then, every batch is confirmed by a person.
 
 ### Mirroring interaction
 
-**Not implemented and not tested.** The policy is chosen but unenforced: file chunks belong in the
-existing `TrafficClass.BULK` queue, which is backpressured and already ranks below `CONTROL`, so
-heartbeats cannot be starved by a transfer the way they were by video. That reuse is the intended
-design; no code routes file chunks yet, and no concurrent mirroring test has been run.
+**Routing implemented; concurrent behaviour not tested on hardware.** File bodies travel as
+`TransferChunk`, which `trafficClass()` maps to `TrafficClass.BULK` — backpressured and ranked
+below `CONTROL`, so heartbeats cannot be starved by a transfer the way they were by video. Batch
+negotiation, accept, reject, cancel and acknowledgement all stay on `CONTROL`, and no new socket
+or plaintext path was introduced. What has **not** been done is running a file batch and a live
+mirror at the same time on the two phones and measuring what happens to either.
 
 ## Mirroring reliability (Phase 2)
 

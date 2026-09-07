@@ -141,6 +141,80 @@ class ReceivedFilenameTest {
         assertEquals("a.txt", FilenameSanitizer.sanitizeToByteLimit("a.txt", 255))
     }
 
+    /**
+     * The regression this file exists for.
+     *
+     * 180 ASCII characters is 180 bytes: comfortably inside the 255-byte wire field, so a
+     * byte-only check passes it straight through. The character cap then has to do the work, and
+     * the earlier implementation applied it with `take(120)` -- which cut from the end, where the
+     * extension is. A received PDF arrived with no extension at all and nothing would open it.
+     */
+    @Test
+    fun `a 180 character ASCII name keeps its extension and both limits`() {
+        val raw = "a".repeat(176) + ".pdf"
+        assertEquals(180, raw.length)
+
+        val safe = FilenameSanitizer.sanitizeToByteLimit(raw, 255)
+
+        assertTrue("extension lost: '$safe'", safe.endsWith(".pdf"))
+        assertTrue("over the character cap: ${safe.length}", safe.length <= FilenameSanitizer.MAX_LENGTH)
+        assertTrue("over the byte cap", safe.toByteArray(Charsets.UTF_8).size <= 255)
+        // The stem is cut, not the extension: everything before the dot is still the original run.
+        assertEquals("a".repeat(FilenameSanitizer.MAX_LENGTH - 4), safe.substringBeforeLast('.'))
+    }
+
+    @Test
+    fun `the character cap applies even when the byte cap is generous`() {
+        val safe = FilenameSanitizer.sanitizeToByteLimit("b".repeat(400) + ".jpg", Int.MAX_VALUE)
+        assertEquals(FilenameSanitizer.MAX_LENGTH, safe.length)
+        assertTrue(safe.endsWith(".jpg"))
+    }
+
+    @Test
+    fun `the byte cap applies even when the character cap is generous`() {
+        // 40 CJK characters: 40 chars, 120 bytes. Under the character cap, over a 64-byte field.
+        val safe = FilenameSanitizer.sanitizeToByteLimit("\u6f22".repeat(40) + ".txt", 64)
+        assertTrue(safe.toByteArray(Charsets.UTF_8).size <= 64)
+        assertTrue(safe.length <= FilenameSanitizer.MAX_LENGTH)
+        assertTrue(safe.endsWith(".txt"))
+    }
+
+    @Test
+    fun `sanitize preserves the extension when it truncates`() {
+        // sanitize() shares the same truncation, so the character-capped path keeps the type hint
+        // too. Its documented length behaviour is unchanged.
+        val safe = FilenameSanitizer.sanitize("c".repeat(500) + ".jpg")
+        assertEquals(FilenameSanitizer.MAX_LENGTH, safe.length)
+        assertTrue(safe.endsWith(".jpg"))
+    }
+
+    @Test
+    fun `a long name with no extension is still capped`() {
+        val safe = FilenameSanitizer.sanitizeToByteLimit("d".repeat(300), 255)
+        assertEquals(FilenameSanitizer.MAX_LENGTH, safe.length)
+        assertFalse(safe.contains('.'))
+    }
+
+    @Test
+    fun `a suspiciously long extension is not treated as one`() {
+        // 40 characters after the final dot is a dotted name, not a type hint. Reserving it would
+        // spend a third of the budget on something no viewer will use.
+        val raw = "e".repeat(150) + "." + "f".repeat(40)
+        val safe = FilenameSanitizer.sanitizeToByteLimit(raw, 255)
+        assertEquals(FilenameSanitizer.MAX_LENGTH, safe.length)
+        assertTrue("should have kept the readable stem", safe.startsWith("e".repeat(100)))
+    }
+
+    @Test
+    fun `a path traversal attempt longer than the cap is still one component`() {
+        val raw = "../".repeat(40) + "g".repeat(200) + ".bin"
+        val safe = FilenameSanitizer.sanitizeToByteLimit(raw, 255)
+        assertFalse(safe.contains('/'))
+        assertFalse(safe.contains(".."))
+        assertTrue(safe.endsWith(".bin"))
+        assertTrue(safe.length <= FilenameSanitizer.MAX_LENGTH)
+    }
+
     @Test
     fun `an all-extension pathological name still fits`() {
         val safe = FilenameSanitizer.sanitizeToByteLimit("." + "x".repeat(400), 32)

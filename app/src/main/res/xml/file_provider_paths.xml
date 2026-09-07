@@ -2,16 +2,24 @@
 <!--
   What the FileProvider is allowed to expose.
 
-  Only the two cache subdirectories the transfer code writes, never the whole cache and never
-  external storage. A FileProvider rooted at "." would let any path traversal that got past the
-  filename sanitiser turn into a readable URI for arbitrary app-private data, so the root is kept
-  as narrow as the feature allows.
+  Exactly one directory: the one holding verified, complete files. Never the whole cache, never
+  external storage, never the in-flight staging directory. A FileProvider rooted at "." would let
+  any path traversal that got past the filename sanitiser turn into a readable URI for arbitrary
+  app-private data, so the root is kept as narrow as the feature allows.
 
-  Names must match ContentCache's directory layout.
+  The path must be the FULL path under cacheDir, including the "relay_cache" container:
+  ContentCache puts files in <cacheDir>/relay_cache/ready/. This said "ready/" for a while, which
+  resolves to <cacheDir>/ready/ and matches nothing, so the first real getUriForFile call threw
+  IllegalArgumentException and took the app down. It went unnoticed because nothing exercised the
+  provider until the received-files actions existed. Keep it in step with
+  ContentCache.DIRECTORY_NAME; FileProviderPathTest fails if it drifts again.
+
+  "incoming/" is deliberately absent. Partials are unverified: their hash has not been checked, so
+  their bytes are whatever the peer sent. Granting a URI to one would hand another app a
+  half-written file that failed integrity checking, and nothing in the app needs to read a partial
+  back out through a content URI: the receiver holds its own File handle while writing.
 -->
 <paths>
     <!-- Verified, complete files, ready to open or share. -->
-    <cache-path name="received" path="ready/" />
-    <!-- In-flight partials. Exposed so a future resume can read one back; never shared onward. -->
-    <cache-path name="incoming" path="incoming/" />
+    <cache-path name="received" path="relay_cache/ready/" />
 </paths>

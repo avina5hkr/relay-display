@@ -45,6 +45,16 @@ fun DisplayHomeScreen(
 ) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
 
+    // Modal, and outside the scrolling content: an offer waiting on an answer must not be
+    // something the user can scroll away from without answering.
+    ui.incomingBatch?.let { batch ->
+        IncomingBatchDialog(
+            batch = batch,
+            onAccept = viewModel::acceptIncomingBatch,
+            onReject = viewModel::rejectIncomingBatch,
+        )
+    }
+
     Column(modifier.fillMaxSize()) {
         // Pinned: settings is reachable without scrolling the page.
         RelayTopBar(
@@ -107,6 +117,11 @@ fun DisplayHomeScreen(
                 modifier = Modifier.testTag("display_pair"),
             )
         }
+
+        ReceivedFilesSection(
+            files = ui.receivedFiles,
+            onDelete = viewModel::deleteReceivedFile,
+        )
 
         SectionHeader("Network")
         RelayCard {

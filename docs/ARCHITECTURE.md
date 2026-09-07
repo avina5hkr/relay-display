@@ -151,18 +151,53 @@ policy decision:
 | --- | --- |
 | Limits, metadata and batch validation, executable warning | `content/FileTransferPolicy.kt` (pure, no Android) |
 | Batch and per-file phases | `content/FileBatchState.kt` (pure, no Android) |
+| An offered batch awaiting a decision | `content/IncomingBatch.kt` (pure, no Android) |
+| A stored, verified file and its metadata sidecar | `content/ReceivedFiles.kt` |
 | Untrusted filenames | `content/FilenameSanitizer` in `UrlValidation.kt` |
+| Measuring and digesting a source before offering | `ContentSource.prepare()` in `content/ContentSource.kt` |
+| Reading a picked file through the resolver | `UriContentSource.forGenericFile()` |
+| Batch driving: offer, await consent, stream in order | `content/ContentRouter.kt` (`sendFileBatch`, `runBatch`) |
 | Receiver stream lifecycle, digest, atomic promote | `content/TransferReceiver.kt` (existing, extended) |
-| Temporary and promoted file storage | `content/ContentCache.kt` (existing) |
-| Protocol serialisation | `protocol/MessageCodec.kt` (existing) |
+| Temporary and promoted file storage, retention | `content/ContentCache.kt` (existing, extended) |
+| Protocol serialisation, including the batch manifest | `protocol/MessageCodec.kt` (existing, extended) |
 | Handing a file to another app | `FileProvider`, scoped by `res/xml/file_provider_paths.xml` |
+| Picker, review list, batch progress | `ui/controller/FileSendSection.kt`, used by both `ControllerHomeScreen` and `SendScreen` |
+| Incoming prompt, received-files list and actions | `ui/display/ReceivedFiles.kt` + `DisplayViewModel` |
 
-`FileTransferPolicy` and `FileBatchState` have no Android dependency at all, which is why the
-security-critical rules run in milliseconds on the JVM instead of needing a device.
+`FileTransferPolicy`, `FileBatchState` and `IncomingBatch` have no Android dependency at all,
+which is why the security-critical rules run in milliseconds on the JVM instead of needing a
+device.
 
-File chunks are intended to travel on the existing `TrafficClass.BULK` queue — backpressured
+**One file-sending UI, two entry points.** The dashboard's **Files** tile and the Send screen's
+Files section both render `FileSendSection` and both resolve the same `SendViewModel` (keyed
+`"send"`), so there is one batch and one place its state lives. The tile picks straight into the
+system picker and shows the review list in place rather than navigating first — the same reasoning
+the Image and PDF tiles already followed, since the next thing the user sees is a system picker
+either way. `SendFocus` was deliberately *not* extended with a `FILES` value: it describes the text
+composer (draft label, "Show as text"), so a file entry in it would have forced meaningless labels
+and added a bogus button to the composer's list of alternatives.
+
+**One streaming implementation, two callers.** `ContentRouter.streamOneFile` owns the whole
+per-file protocol exchange, and both the presentation path (`sendFile`, for images and PDFs) and
+the batch path (`runBatch`) go through it. They differ only in what they show the user, which is
+what its callbacks are for. Duplicating the chunk loop would mean fixing every streaming bug
+twice.
+
+**The batch wraps the per-file exchange rather than replacing it.** A batch adds one confirmation
+in front; each file then streams through the `CONTENT_OFFER / TRANSFER_*` machinery that already
+existed and was already tested. That is also why sending is strictly sequential:
+`ContentLimits.MAX_CONCURRENT_TRANSFERS` is 1 and the receiver enforces it by rejecting a second
+offer with `BUSY`, so concurrency here would produce rejections rather than speed.
+
+File chunks travel as `TransferChunk` on the existing `TrafficClass.BULK` queue — backpressured
 rather than lossy, and ranked below `CONTROL` — so a transfer cannot starve heartbeats the way
-video once did. **That routing is not yet wired**; see `docs/IMPLEMENTATION_STATUS.md`.
+video once did. Batch negotiation, accept, reject, cancel and acknowledgement stay on `CONTROL`.
+No new socket and no plaintext path was added.
+
+**Layering note.** `ContentLimits.MAX_FILES_PER_BATCH` lives in the protocol package, not in
+`FileTransferPolicy`, because the decoder needs it to bound a batch manifest before parsing any of
+it. `FileTransferPolicy` re-exports it, exactly as it already does for `MAX_FILE_BYTES`. Putting
+it the other way round would have made `protocol` depend on `content`, which is backwards.
 
 ### Outbound traffic classes
 

@@ -67,6 +67,7 @@ fun ControllerHomeScreen(
     val sendViewModel: SendViewModel = relayViewModel(key = "send") {
         SendViewModel.create(it, context.contentResolver)
     }
+    val sendUi by sendViewModel.uiState.collectAsStateWithLifecycle()
 
     // Image, PDF and screen sharing act immediately. Routing them through a screen first would
     // be an extra tap that buys the user nothing: the very next thing they see is a system
@@ -76,6 +77,16 @@ fun ControllerHomeScreen(
     }
     val pickPdf = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) sendViewModel.sendPickedFile(uri, ui.settings.defaultFitMode)
+    }
+    // Several files at once, any type, through the Storage Access Framework. The picker itself is
+    // the permission: the user chooses exactly which files this app may read and the system grants
+    // access to those URIs alone, which is why the app holds no storage permission at all.
+    val pickFiles = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        // Nothing is sent yet. The review list appears below the tiles, because a multi-select
+        // picker makes it very easy to pick more, or other, files than intended.
+        sendViewModel.onFilesPicked(uris)
     }
     val projectionConsent = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -197,6 +208,24 @@ fun ControllerHomeScreen(
                         testTag = "tile_pdf",
                         modifier = Modifier.weight(1f),
                     )
+                    // Paired with PDF because both open a picker, and because a stack-of-sheets
+                    // glyph next to a single-sheet one is the distinction the grid is scanned by.
+                    //
+                    // Disabled unless the other phone announced `file-v1`: the refusal is worth
+                    // saying before the user picks twenty files, not after.
+                    ActionTile(
+                        icon = RelayIcon.FILES,
+                        label = "Files",
+                        onClick = { pickFiles.launch(arrayOf("*/*")) },
+                        enabled = ui.canSendContent && sendUi.peerSupportsFiles,
+                        testTag = "tile_files",
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                VerticalGap(10.dp)
+                // Its own row: seven tiles do not divide into pairs, and screen sharing is the
+                // heaviest action here, so it gets the width rather than an empty gap beside it.
+                Row(Modifier.fillMaxWidth()) {
                     ActionTile(
                         icon = RelayIcon.SCREEN_SHARE,
                         label = "Share screen",
@@ -204,6 +233,20 @@ fun ControllerHomeScreen(
                         enabled = ui.canSendContent,
                         testTag = "tile_mirror",
                         modifier = Modifier.weight(1f),
+                    )
+                }
+
+                // Review and progress for a file batch, in place. Picking from a tile should not
+                // also mean being moved to another screen: the next thing the user sees is the
+                // system picker either way, and after it they are back here.
+                if (sendUi.picked.isNotEmpty() || sendUi.fileBatch != null) {
+                    VerticalGap(RelayDimens.Gap)
+                    FileSendSection(
+                        ui = sendUi,
+                        viewModel = sendViewModel,
+                        onPick = { pickFiles.launch(arrayOf("*/*")) },
+                        // The tile above is already the way in.
+                        showPickAction = false,
                     )
                 }
             }

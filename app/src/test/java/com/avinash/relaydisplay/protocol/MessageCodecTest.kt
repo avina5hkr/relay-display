@@ -59,6 +59,19 @@ class MessageCodecTest {
         MirrorFrame(id, 987654L, true, ByteArray(2048) { it.toByte() }),
         MirrorStop(id, "projection revoked"),
         MirrorKeyframeRequest(id),
+        FileBatchOffer(
+            id = id,
+            batchId = transferId,
+            senderName = "Avi's phone",
+            files = listOf(
+                FileManifestEntry("report.pdf", "application/pdf", 1_234L),
+                // A non-ASCII name and an empty MIME type in the same sample: both are ordinary,
+                // and both are where a hand-rolled manifest encoding goes wrong.
+                FileManifestEntry("\u6f22\u5b57 notes.txt", "", 0L),
+            ),
+        ),
+        FileBatchAccept(id, transferId),
+        FileBatchReject(id, transferId, ProtocolErrorCode.PERMISSION_DENIED),
     )
 
     @Test

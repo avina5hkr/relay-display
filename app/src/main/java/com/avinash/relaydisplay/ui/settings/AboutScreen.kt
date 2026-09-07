@@ -141,10 +141,15 @@ private fun TabRow(selected: AboutTab, onSelect: (AboutTab) -> Unit) {
 private fun AboutTabContent(onBack: () -> Unit) {
     RelayCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // The launcher mark, at text scale. Enough to tie the screen to the app's identity
+            // The in-app mark, at text scale. Enough to tie the screen to the app's identity
             // without turning an information screen into a splash page.
+            //
+            // Deliberately NOT R.mipmap.ic_launcher: on API 26+ that resolves to
+            // mipmap-anydpi-v26/ic_launcher.xml, an <adaptive-icon>, which painterResource
+            // cannot inflate. R.drawable.relay_display_mark is a plain vector of the same
+            // artwork with the plate baked in. Both come from branding/generate_launcher_icons.py.
             Image(
-                painter = painterResource(R.mipmap.ic_launcher),
+                painter = painterResource(R.drawable.relay_display_mark),
                 contentDescription = null,
                 modifier = Modifier.size(40.dp),
             )

@@ -93,15 +93,47 @@ object UrlValidation {
 object FilenameSanitizer {
 
     const val MAX_LENGTH = 120
+
+    /**
+     * Longest run of characters after the final dot still treated as an extension.
+     *
+     * Anything longer is far more likely to be a dotted name than a type hint, and reserving 40
+     * characters of a 120-character budget for it would eat the part a person actually reads.
+     */
+    private const val MAX_EXTENSION_LENGTH = 16
+
     private const val FALLBACK = "received-file"
 
-    fun sanitize(raw: String): String = clean(raw).take(MAX_LENGTH)
+    /**
+     * Sanitises and caps at [MAX_LENGTH] characters, keeping the extension.
+     *
+     * Names arriving from a peer or a `ContentResolver` are untrusted, so the result is always
+     * a single path component with no control characters.
+     */
+    fun sanitize(raw: String): String = fit(clean(raw), MAX_LENGTH, Int.MAX_VALUE)
+
+    /**
+     * Sanitises, then caps by **bytes** as well as characters.
+     *
+     * The two limits are not interchangeable, which is the whole reason this exists: the wire
+     * field and most filesystems bound bytes, and one emoji or CJK character is three to four
+     * bytes, so a 120-character name can be 480 bytes and overflow a 255-byte field. Equally, a
+     * 180-character ASCII name is only 180 bytes and passes the byte check while still being
+     * too long for the character cap.
+     *
+     * Both bounds therefore apply to every result, and neither is allowed to cost the extension.
+     * An earlier version returned early when the byte check passed and then applied `take(120)`,
+     * which silently truncated exactly that 180-character ASCII case and threw the extension
+     * away; the regression test in ReceivedFilenameTest pins the fix.
+     */
+    fun sanitizeToByteLimit(raw: String, maxBytes: Int): String =
+        fit(clean(raw), MAX_LENGTH, maxBytes)
 
     /**
      * Sanitises without any length cap.
      *
-     * Split out because [sanitize] truncates by characters and drops the extension when it does,
-     * so a byte-limited caller must start from the untruncated name or it can never preserve one.
+     * Split out because both public entry points must start from the untruncated name: truncating
+     * first and looking for an extension afterwards can only ever find one that survived by luck.
      */
     private fun clean(raw: String): String {
         // Take the last segment first, so "../../etc/passwd" reduces to "passwd" before anything
@@ -125,53 +157,67 @@ object FilenameSanitizer {
     }
 
     /**
-     * Sanitises, then truncates to a **byte** budget rather than a character count.
+     * Brings an already-cleaned name inside **both** budgets, preserving the extension.
      *
-     * [sanitize] caps at [MAX_LENGTH] characters, which is not the same thing: the wire field and
-     * most filesystems bound bytes, and one emoji or CJK character is three to four bytes, so a
-     * 120-character name can be 480 bytes and overflow a 255-byte field.
-     *
-     * Two details that are easy to get wrong and are covered by tests:
-     *  - truncation walks **code points**, not `Char`s. Dropping UTF-16 code units splits
-     *    surrogate pairs and produces a string that cannot be re-encoded.
-     *  - the extension is preserved where it fits, because it is the only hint about what the
-     *    file is once the stem has been cut.
+     * The single place either limit is applied, so they cannot drift apart. Order matters: the
+     * extension is reserved out of both budgets first, the stem gets whatever is left, and the
+     * extension is dropped only when it genuinely cannot fit.
      */
-    fun sanitizeToByteLimit(raw: String, maxBytes: Int): String {
-        val cleaned = clean(raw)
-        if (cleaned.utf8Size() <= maxBytes) return cleaned.take(MAX_LENGTH).ifEmpty { FALLBACK }
+    private fun fit(cleaned: String, maxChars: Int, maxBytes: Int): String {
+        if (cleaned.length <= maxChars && cleaned.utf8Size() <= maxBytes) return cleaned
 
         val extension = cleaned.substringAfterLast('.', "")
-        val suffix = if (extension.isNotEmpty() && extension.length <= 16) ".$extension" else ""
-        val stem = if (suffix.isEmpty()) cleaned else cleaned.dropLast(suffix.length)
+        val suffix = if (extension.isNotEmpty() && extension.length <= MAX_EXTENSION_LENGTH) {
+            ".$extension"
+        } else {
+            ""
+        }
+        // dropLast on an empty suffix is a no-op, so this covers the no-extension case too.
+        val stem = cleaned.dropLast(suffix.length)
 
-        // Try to keep the extension. If even that does not fit, fall through to a bare stem.
-        val withSuffix = truncateToBytes(stem, maxBytes - suffix.utf8Size()) + suffix
-        if (withSuffix.utf8Size() <= maxBytes && withSuffix != suffix) return withSuffix
+        // Keep the extension if a non-empty stem can still be placed in front of it. A name that
+        // is nothing but an extension is not worth returning.
+        if (suffix.isNotEmpty()) {
+            val kept = truncate(stem, maxChars - suffix.length, maxBytes - suffix.utf8Size())
+            if (kept.isNotEmpty()) return kept + suffix
+        }
 
-        return truncateToBytes(cleaned, maxBytes).ifEmpty { FALLBACK.take(maxBytes) }
+        // The extension does not fit, or there was none. Salvage as much of the name as the
+        // budgets allow.
+        val bare = truncate(cleaned, maxChars, maxBytes)
+        return bare.ifEmpty { truncate(FALLBACK, maxChars, maxBytes) }
     }
 
     private fun String.utf8Size(): Int = toByteArray(Charsets.UTF_8).size
 
-    /** Keeps whole code points only, so the result always re-encodes cleanly. */
-    private fun truncateToBytes(value: String, maxBytes: Int): String {
-        if (maxBytes <= 0) return ""
-        if (value.utf8Size() <= maxBytes) return value
+    /**
+     * Truncates to whole code points within a character budget and a byte budget at once.
+     *
+     * Walking code points rather than `Char`s is what keeps the result re-encodable: dropping a
+     * single UTF-16 code unit splits a surrogate pair and leaves an unpaired surrogate, which no
+     * longer round-trips through UTF-8. `charCount` is charged against maxChars for the same
+     * reason -- an astral character costs two `Char`s of any downstream `length` check.
+     */
+    private fun truncate(value: String, maxChars: Int, maxBytes: Int): String {
+        if (maxChars <= 0 || maxBytes <= 0) return ""
+        if (value.length <= maxChars && value.utf8Size() <= maxBytes) return value
         val kept = StringBuilder()
-        var used = 0
+        var usedBytes = 0
+        var usedChars = 0
         var index = 0
         while (index < value.length) {
             val codePoint = value.codePointAt(index)
             val charCount = Character.charCount(codePoint)
             val piece = value.substring(index, index + charCount)
             val width = piece.utf8Size()
-            if (used + width > maxBytes) break
+            if (usedBytes + width > maxBytes || usedChars + charCount > maxChars) break
             kept.append(piece)
-            used += width
+            usedBytes += width
+            usedChars += charCount
             index += charCount
         }
-        return kept.toString()
+        // A trailing space or dot would be re-trimmed by any later clean() and confuses shells.
+        return kept.toString().trimEnd().trimEnd('.')
     }
 
     /**

@@ -54,6 +54,15 @@ object ContentLimits {
 
     /** Only this many bulk transfers may be in flight at once (backpressure on the display). */
     const val MAX_CONCURRENT_TRANSFERS: Int = 1
+
+    /**
+     * Most files in one offered batch.
+     *
+     * Lives here rather than in FileTransferPolicy because the decoder needs it: it bounds the
+     * batch manifest before any of it is parsed. FileTransferPolicy re-exports it so the feature
+     * code has one place to look, exactly as it does for [MAX_FILE_BYTES].
+     */
+    const val MAX_FILES_PER_BATCH: Int = 20
 }
 
 /** Timing budgets. Documented so they can be tuned from real measurements. */

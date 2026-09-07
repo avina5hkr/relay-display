@@ -77,7 +77,12 @@ class TransferReceiver(private val cache: ContentCache) {
             return TransferOutcome.Rejected(ProtocolErrorCode.UNSUPPORTED_FORMAT, "unsupported type")
         }
         // Ask for the whole file plus headroom, so accepting never fills the volume.
-        if (cache.usableSpaceBytes() < offer.sizeBytes + ContentCache.STORAGE_HEADROOM_BYTES) {
+        //
+        // Written as a subtraction rather than `usable < size + headroom` on purpose. sizeBytes is
+        // peer-controlled, and while the MAX_FILE_BYTES check above currently guarantees it is
+        // small, an addition would overflow to a negative number for a size near Long.MAX_VALUE
+        // and silently pass the check. This form cannot, whatever order the checks end up in.
+        if (cache.usableSpaceBytes() - ContentCache.STORAGE_HEADROOM_BYTES < offer.sizeBytes) {
             return TransferOutcome.Rejected(ProtocolErrorCode.INSUFFICIENT_STORAGE, "not enough space")
         }
 
@@ -85,7 +90,12 @@ class TransferReceiver(private val cache: ContentCache) {
         expectedBytes = offer.sizeBytes
         expectedDigest = offer.sha256
         declaredMime = offer.mimeType
-        displayName = FilenameSanitizer.sanitize(offer.displayName)
+        // Byte-bounded, not just character-bounded: this name is written to disk and may be
+        // handed to a chooser, and the two limits are not the same thing for non-ASCII names.
+        displayName = FilenameSanitizer.sanitizeToByteLimit(
+            offer.displayName,
+            ContentLimits.MAX_FILENAME_BYTES,
+        )
         kind = offer.kind
         return TransferOutcome.Continue
     }
@@ -168,7 +178,24 @@ class TransferReceiver(private val cache: ContentCache) {
             return fail(ProtocolErrorCode.UNSUPPORTED_FORMAT, "content does not match its type")
         }
 
-        val promoted = cache.promote(file, complete.transferId, MimeSupport.extensionFor(sniffed))
+        // Extension: from the sniffed content for the types this app recognises, and from the
+        // sanitised name for everything else. Sniffing cannot identify most files, so a generic
+        // file would otherwise be stored with no extension at all -- which survives an "open"
+        // (that goes by MIME type) but produces an extensionless file when the user saves it out.
+        // ContentCache.safeExtension strips anything unusable from the name-derived value.
+        val extension = MimeSupport.extensionFor(sniffed)
+            ?: displayName.substringAfterLast('.', "").takeIf { it.isNotEmpty() }
+
+        // Metadata only for generic files. Images and PDFs are shown straight away and their
+        // labels live in the presentation state; a generic file has to survive in a list the user
+        // returns to later, possibly after a restart.
+        val metadata = if (kind == ContentKind.FILE) {
+            ContentCache.PromotedMetadata(displayName = displayName, mimeType = declaredMime)
+        } else {
+            null
+        }
+
+        val promoted = cache.promote(file, complete.transferId, extension, metadata)
             ?: return fail(ProtocolErrorCode.INSUFFICIENT_STORAGE, "could not store the file")
         partial = null
         stage = Stage.DONE

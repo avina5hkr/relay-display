@@ -84,7 +84,15 @@ class GenericFileReceiveTest {
         return r.finish(TransferComplete(UUID.randomUUID(), transferId, digestOverride ?: sha256(bytes)))
     }
 
-    private fun readyFiles() = File(cacheRoot, "ready").listFiles()?.toList().orEmpty()
+    /**
+     * Promoted payloads, excluding the `.meta` sidecars that carry a received file's display name.
+     *
+     * A generic file is promoted with a sidecar, so a raw directory listing counts two entries per
+     * file. The sidecar is real and tested separately; these assertions are about payloads.
+     */
+    private fun readyFiles() = File(cacheRoot, "ready").listFiles()
+        ?.filterNot { it.name.endsWith(".meta") }
+        .orEmpty()
     private fun partialFiles() = File(cacheRoot, "incoming").listFiles()?.toList().orEmpty()
 
     // -- the happy path ----------------------------------------------------------------------

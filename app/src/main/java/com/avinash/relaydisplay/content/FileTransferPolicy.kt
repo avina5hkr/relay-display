@@ -24,8 +24,13 @@ object FileTransferPolicy {
      */
     const val WIRE_VERSION = 1
 
-    /** Largest batch the sender will offer and the receiver will accept. */
-    const val MAX_FILES_PER_BATCH = 20
+    /**
+     * Largest batch the sender will offer and the receiver will accept.
+     *
+     * Shares [ContentLimits.MAX_FILES_PER_BATCH] with the codec, which needs the same number to
+     * bound a batch manifest before parsing it.
+     */
+    const val MAX_FILES_PER_BATCH = ContentLimits.MAX_FILES_PER_BATCH
 
     /**
      * Largest single file.
@@ -40,21 +45,44 @@ object FileTransferPolicy {
     const val MAX_BATCH_BYTES = 200L * 1024L * 1024L
 
     /**
-     * Most bytes the receiver will hold in completed-but-unclaimed files.
+     * Most bytes the receiver retains in completed-but-unclaimed files.
      *
      * Without this, repeated accepted batches fill the cache partition even though each one was
      * individually within limits.
+     *
+     * Must be at least [MAX_BATCH_BYTES], or accepting a batch that passed validation would evict
+     * part of that same batch before the user could open any of it. Two batches' worth is the
+     * chosen headroom. [ContentCache] takes its byte budget from here so the two cannot drift;
+     * [retentionInvariantsHold] pins the relationship and a unit test asserts it.
      */
-    const val MAX_PENDING_BYTES = 400L * 1024L * 1024L
+    const val MAX_PENDING_BYTES = 2L * MAX_BATCH_BYTES
 
-    /** Most completed-but-unclaimed files retained. */
-    const val MAX_PENDING_FILES = 60
+    /**
+     * Most completed-but-unclaimed files retained.
+     *
+     * Must be at least [MAX_FILES_PER_BATCH] for the same reason. This limit previously sat at 12
+     * inside [ContentCache] while a batch could legally carry 20 files, so accepting a full batch
+     * silently deleted the first 8 files of it.
+     */
+    const val MAX_PENDING_FILES = 3 * MAX_FILES_PER_BATCH
 
-    /** How long a partial or unclaimed file survives before the cache sweeps it. */
+    /**
+     * How long a received or partial file survives before the cache sweeps it.
+     *
+     * Enforced by [ContentCache.sweepExpired], called on the same startup pass that clears
+     * partials. Received files live in the app cache directory, which the system may reclaim at
+     * any time anyway; this bounds how long they sit there when it does not.
+     */
     const val PENDING_EXPIRY_MS = 24L * 60L * 60L * 1000L
 
-    /** Silence on an in-flight transfer that means the peer is gone rather than slow. */
-    const val INACTIVITY_TIMEOUT_MS = 30_000L
+    /**
+     * Whether the retention budget can actually hold one whole valid batch.
+     *
+     * A guard against someone tuning one number without the other. Checked by a unit test rather
+     * than at runtime, because it is a property of the constants above and cannot vary.
+     */
+    fun retentionInvariantsHold(): Boolean =
+        MAX_PENDING_BYTES >= MAX_BATCH_BYTES && MAX_PENDING_FILES >= MAX_FILES_PER_BATCH
 
     /** MIME reported when the document provider will not say. */
     const val FALLBACK_MIME = "application/octet-stream"
@@ -96,15 +124,32 @@ object FileTransferPolicy {
         return extension.isNotEmpty() && extension in EXECUTABLE_EXTENSIONS
     }
 
-    /** Size unknown: a content provider is not obliged to report one. */
+    /**
+     * Size unknown: a content provider is not obliged to report one.
+     *
+     * **Local only. This value never travels on the wire.** It describes the window between
+     * picking a file and preparing it: the picker shows "Unknown size" in the review list, and
+     * [ContentSource.prepare] then measures the stream and replaces it with the real length before
+     * anything is offered. A receiver therefore always sees a real size, and any negative size
+     * arriving from a peer is a malformed frame.
+     *
+     * That split is what resolved a genuine contradiction. The picker used to refuse a file whose
+     * size was unreported (`size <= 0`, which also refused legitimately empty files) while the
+     * protocol documentation claimed `-1` was supported and the receiver rejected every negative
+     * value. All three can now be true at once because "unknown" stops existing at the boundary.
+     */
     const val SIZE_UNKNOWN = -1L
 
     /**
      * Validates one file's metadata before any byte is accepted.
      *
-     * [declaredSize] may be [SIZE_UNKNOWN]; a provider that cannot stat its own stream is normal,
-     * and refusing those would rule out a lot of ordinary content URIs. What is not allowed is a
-     * *negative* size that is not the sentinel, or one above the limit.
+     * [declaredSize] may be [SIZE_UNKNOWN] when this is called on the *sending* side for a freshly
+     * picked file: a provider that cannot stat its own stream is normal, and refusing those would
+     * rule out a lot of ordinary content URIs. What is not allowed is a *negative* size that is not
+     * the sentinel, or one above the limit.
+     *
+     * On the *receiving* side the sentinel can never appear, because the decoder rejects any
+     * negative size before a frame becomes a message. Sizes there are always measured values.
      */
     fun validateFileMetadata(
         rawName: String,
@@ -136,11 +181,19 @@ object FileTransferPolicy {
         if (files.size > MAX_FILES_PER_BATCH) {
             return BatchVerdict.Invalid("more than $MAX_FILES_PER_BATCH files in one batch")
         }
-        // Only known sizes contribute. A batch of unknown-size files cannot be pre-checked
-        // against the total, and is bounded per-file during streaming instead.
-        val knownTotal = files.filter { it.sizeBytes != SIZE_UNKNOWN }.sumOf { it.sizeBytes }
-        if (knownTotal > MAX_BATCH_BYTES) {
-            return BatchVerdict.Invalid("batch is larger than the ${MAX_BATCH_BYTES / (1024 * 1024)} MiB limit")
+        // Accumulated with an early exit rather than summed, so the running total can never
+        // overflow: sumOf over attacker-influenced longs wraps silently and a wrapped negative
+        // total would pass the comparison below. Every element is already <= MAX_FILE_BYTES, so
+        // this only matters if that ever stops being true, which is exactly when it would bite.
+        var knownTotal = 0L
+        for (file in files) {
+            if (file.sizeBytes == SIZE_UNKNOWN) continue
+            if (file.sizeBytes > MAX_BATCH_BYTES - knownTotal) {
+                return BatchVerdict.Invalid(
+                    "batch is larger than the ${MAX_BATCH_BYTES / (1024 * 1024)} MiB limit",
+                )
+            }
+            knownTotal += file.sizeBytes
         }
         return BatchVerdict.Valid(files, knownTotal)
     }

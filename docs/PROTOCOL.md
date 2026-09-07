@@ -109,6 +109,9 @@ rejected with `UNKNOWN_MESSAGE_TYPE` rather than ignored, so a downgrade is visi
 | 0x0043–0x0046 | TRANSFER_START / CHUNK / COMPLETE / CANCEL | yes |
 | 0x0047 | SHOW_FILE | yes |
 | 0x0048 | PDF_PAGE_COMMAND | yes |
+| 0x0049 | FILE_BATCH_OFFER | yes |
+| 0x004A | FILE_BATCH_ACCEPT | yes |
+| 0x004B | FILE_BATCH_REJECT | yes |
 | 0x0050–0x0054 | MIRROR_START / CONFIG / FRAME / STOP / KEYFRAME_REQUEST | yes |
 
 "Secure" means the message is refused if it arrives before the session is encrypted. That check
@@ -201,6 +204,86 @@ old build keeps failing cleanly rather than half-parsing a newer wire format.
 image or PDF is not, because there is nothing for a decoder to open. The offer gate is therefore
 kind-aware rather than uniformly permissive.
 
+### The batch exchange
+
+A batch wraps the per-file exchange rather than replacing it. One confirmation covers the whole
+selection; each file then streams through the `CONTENT_OFFER / TRANSFER_*` machinery that already
+existed and was already tested.
+
+```
+Controller                                  Display
+    | FILE_BATCH_OFFER  batchId, senderName, manifest
+    |------------------------------------------->|   (user is asked)
+    |                                            |
+    |        FILE_BATCH_ACCEPT batchId           |
+    |<-------------------------------------------|
+    |                                            |
+    |   ... per file, sequentially:              |
+    |   CONTENT_OFFER / TRANSFER_START /         |
+    |   TRANSFER_CHUNK* / TRANSFER_COMPLETE /    |
+    |   SHOW_FILE(kind=FILE)                     |
+    |------------------------------------------->|
+```
+
+Or `FILE_BATCH_REJECT batchId, errorCode` in place of the accept, which ends the exchange. Nothing
+is sent after a rejection.
+
+**Consent is required and it is scoped.** A `CONTENT_OFFER` with `kind = FILE` that does not have
+an accepted batch behind it is refused with `PERMISSION_DENIED`. Being paired establishes which
+phone is on the other end; it does not establish that its user's request is wanted right now. The
+acceptance is spent once the batch's promised file count has arrived, and is discarded whenever the
+session ends, so consent never outlives the connection it was given on.
+
+**Batch manifest encoding.** The TLV layer keys fields by tag in a map, so it has no repeated
+fields and the file list needs a nested encoding inside one `bytes` field:
+
+```
+per entry:  u16 nameLen | name (UTF-8) | u16 mimeLen | mime (UTF-8) | i64 sizeBytes
+```
+
+Entry order is meaningful: it is the order files are sent, and the receiver's "3 of 7" counts
+against it. The decoder bounds the whole field before parsing, requires the entry count to match
+the `u8` count in the header, rejects any length that exceeds the remaining buffer or its own
+field limit, and treats trailing bytes as `MALFORMED_FRAME` rather than ignoring them.
+
+### Queue ordering is part of the transfer contract
+
+`TRANSFER_CHUNK` and `TRANSFER_COMPLETE` travel on the **same** queue (`BULK`), and that is a
+requirement rather than an implementation detail. The session writer is strict priority: anything
+on `CONTROL` is written before anything on `BULK`. A completion on `CONTROL` therefore overtakes
+chunks still queued, and the receiver — which requires chunks in order and checks the byte count
+before the digest — rejects a file that was never corrupt.
+
+Observed on hardware: a 19.9 MB file arrived as exactly 301 of 304 chunks. Small transfers never
+show it, because `BULK` has no backlog to jump.
+
+`TRANSFER_START` is safe on `CONTROL`: overtaking can only make it arrive earlier, and it must
+precede its chunks anyway. `TRANSFER_CANCEL` stays on `CONTROL` deliberately — cancelling is meant
+to overtake the backlog it is abandoning.
+
+### Sizes are measured, not declared
+
+**No "unknown size" sentinel travels on the wire.** A `ContentResolver` is not obliged to report a
+size, so the sender resolves it before offering: a single bounded preparation pass streams the
+source once, counting bytes and computing the SHA-256 the offer has to carry anyway. The size in
+`CONTENT_OFFER` and in a batch manifest is therefore always the real length of the bytes that will
+arrive.
+
+This is deliberate, and it replaced a contradiction. The picker used to refuse anything whose size
+was not reported (`size <= 0`, which also refused legitimately empty files) while this document
+claimed `-1` was supported and the receiver rejected every negative size. Measuring settles it
+without a policy argument and costs nothing, because the digest pass already had to read the whole
+stream. Consequences:
+
+- a receiver can always show a real total and check it against its own limits before asking;
+- "the file changed while sending" can no longer be caused by a merely inaccurate provider;
+- a source that yields different bytes on the second read fails the receiver's digest check, which
+  is the correct outcome and is what that check is for;
+- any negative size on the wire is `MALFORMED_FRAME`.
+
+**Zero is a real size.** An empty generic file transfers normally. An empty image or PDF is still
+refused, because there is nothing for a decoder to open.
+
 ### Limits
 
 Enforced by `FileTransferPolicy` before anything is allocated, opened or written.
@@ -209,18 +292,29 @@ Enforced by `FileTransferPolicy` before anything is allocated, opened or written
 | --- | ---: |
 | Files per batch | 20 |
 | Single file | 50 MiB (shared with image/PDF) |
-| Batch total, known sizes | 200 MiB |
-| Receiver pending bytes | 400 MiB |
-| Receiver pending files | 60 |
+| Batch total | 200 MiB |
+| Receiver retained bytes | 400 MiB |
+| Receiver retained files | 60 |
 | Chunk | 64 KiB (existing `CHUNK_BYTES`) |
-| Filename | 255 bytes, truncated by **bytes**, whole code points only |
+| Filename | 255 bytes **and** 120 characters, whole code points only, extension preserved |
 | MIME string | 128 bytes, no control characters |
-| Pending-file expiry | 24 h |
-| Inactivity timeout | 30 s |
+| Retention expiry | 24 h |
 
-A declared size of `-1` means "unknown", which a content provider is entitled to report. Any
-other negative value is `MALFORMED_FRAME`. Unknown sizes do not contribute to the batch total and
-are bounded per-file while streaming instead.
+**The retention budget must be able to hold one whole legal batch.** `ContentCache` takes its byte
+and entry budgets from `FileTransferPolicy` rather than restating them, and
+`FileTransferPolicy.retentionInvariantsHold()` pins the relationship:
+`MAX_PENDING_BYTES >= MAX_BATCH_BYTES` and `MAX_PENDING_FILES >= MAX_FILES_PER_BATCH`. The cache
+previously kept its own copy of these numbers, and its entry budget (12) was smaller than one
+legal batch (20 files), so accepting a full batch silently deleted the first eight files of it.
+Nothing failed; the files were simply gone.
+
+Retention is enforced in three places, all of them real: oldest-first eviction on every promote,
+a partial sweep at startup, and an expiry sweep on the same startup pass. There is no advertised
+limit here that nothing implements.
+
+**Totals are accumulated, not summed.** `validateBatch` adds sizes one at a time with an early
+exit, and the receiver's free-space check subtracts rather than adds, so no attacker-influenced
+value can wrap a total negative and pass a limit comparison.
 
 ## Versioning and compatibility
 

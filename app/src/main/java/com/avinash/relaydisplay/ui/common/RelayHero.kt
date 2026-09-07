@@ -166,13 +166,13 @@ fun ActionTile(
                     Modifier.border(1.dp, scheme.outlineVariant, RoundedCornerShape(18.dp))
                 },
             )
-            .then(
-                if (enabled) {
-                    Modifier.clickable(role = Role.Button, onClick = onClick)
-                } else {
-                    Modifier
-                },
-            )
+            // Always clickable, with `enabled` passed through rather than the modifier omitted.
+            // Omitting it left a disabled tile with no button role and no disabled state at all,
+            // so a screen reader announced it as ordinary text and gave no hint that the action
+            // was unavailable -- the dimming is the only cue a sighted user gets, and it was the
+            // only cue anyone got. This way Compose emits the disabled semantics, the tap is a
+            // no-op, and `assertIsNotEnabled` means something.
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .then(if (testTag != null) Modifier.testTag(testTag) else Modifier)
             .semantics { contentDescription = label }
             .padding(vertical = 14.dp, horizontal = 8.dp),

@@ -168,6 +168,42 @@ Generic file transfer widens what a peer can send from "an image or a PDF" to "a
 name and any declared type". The peer is authenticated, not trusted: pairing proves which phone is
 talking, never that the software on it is behaving.
 
+### Consent, not just pairing
+
+**A generic file is never written without a person agreeing to it.** The controller sends a
+`FILE_BATCH_OFFER` naming the sender, the file count, and every name and size; the receiving phone
+shows that as a modal prompt; nothing is opened or written until the user accepts. A
+`CONTENT_OFFER` with `kind = FILE` that arrives without an accepted batch behind it is refused with
+`PERMISSION_DENIED`.
+
+This exists because pairing answers a different question. Pairing establishes which phone is on the
+other end — it says nothing about whether the software on it is behaving, or whether its user meant
+to push twenty files at this phone right now. Images and PDFs are a presentation the user is
+already watching; arbitrary files landing in storage are not.
+
+The consent is scoped in three ways:
+
+- **Per batch.** One acceptance covers the files that batch declared and no more. Once that many
+  files have arrived, the acceptance is spent and the next batch asks again.
+- **Per session.** It is discarded whenever the session ends, so it can never outlive the
+  connection it was given on.
+- **One at a time.** A second offer arriving while one is pending, or while a transfer is running,
+  is refused with `BUSY` rather than queued behind the first.
+
+Dismissing the prompt — back, or a tap outside it — is a rejection, not a deferral. The
+alternative leaves the sender waiting on an answer that will never arrive.
+
+There is **no auto-accept setting**, and the prompt cannot be disabled. See
+`docs/IMPLEMENTATION_STATUS.md` for why that omission is deliberate.
+
+### Sizes are measured before they are trusted
+
+The sender streams each file once before offering it, counting bytes and computing the SHA-256 the
+offer must carry anyway, so the size the receiver is shown and validates against is the real length
+of the bytes that will arrive. No "unknown size" value travels, and any negative size on the wire
+is a malformed frame. The bound is enforced *during* that pass, so a provider that under-reports
+its own length cannot make the sender read an unbounded amount.
+
 ### Malicious filenames
 
 A received name is untrusted input that ends up labelling a file and, if mishandled, choosing
@@ -181,17 +217,34 @@ The name is never used to build a path in any case. A promoted file is named fro
 UUID, and the sanitised name is only a label. `ReceivedFilenameTest` asserts that no sanitised
 name can contain a separator, across a list of hostile inputs.
 
-Truncation is by **bytes** and walks whole code points. A 120-character CJK name is 360 bytes and
-would overflow a 255-byte field; a byte-wise cut would split a surrogate pair and produce a string
-that cannot be re-encoded.
+Truncation respects a **byte** budget and a **character** budget at once, walks whole code points,
+and keeps the extension. All three matter and they are not interchangeable: a 120-character CJK
+name is 360 bytes and would overflow a 255-byte field, while a 180-character ASCII name is only
+180 bytes and passes every byte check while still being too long. A byte-wise cut would split a
+surrogate pair and produce a string that cannot be re-encoded.
+
+An earlier version applied the two limits in separate places and they contradicted each other: the
+byte check passed a 180-character ASCII name, then a bare character truncation cut the tail off —
+which is where the extension is — so a received PDF arrived with no extension and nothing would
+open it. Both budgets now go through one routine that reserves the extension out of each before
+truncating the stem, and `ReceivedFilenameTest` pins that case.
 
 ### Oversized input and storage exhaustion
 
 Every limit above is checked before allocation. A file over the limit is refused at the offer, so
 nothing is opened. Overflow beyond the declared size is refused mid-stream rather than written.
-Free space plus headroom is validated before acceptance. Batch totals bound what a single accept
-can cost, and the pending-bytes and pending-files caps bound what repeated accepted batches can
-cost — without those, each batch could be individually legal while together filling the partition.
+Free space plus headroom is validated before the user is even asked, so an acceptance cannot be
+followed by a storage refusal half way through. That check subtracts rather than adds, so a size
+near `Long.MAX_VALUE` cannot overflow it into passing. Batch totals bound what a single accept can
+cost, and the retention caps bound what repeated accepted batches can cost — without those, each
+batch could be individually legal while together filling the partition.
+
+Those retention caps are enforced, not merely documented. `ContentCache` takes its byte and entry
+budgets from `FileTransferPolicy`, evicts oldest-first on every promote, sweeps partials at
+startup and sweeps expired files on the same pass. They also have to be large enough to hold one
+legal batch: the cache used to keep its own copy of these numbers with an entry budget of 12 while
+a batch could carry 20 files, so accepting a full batch silently deleted the first eight files of
+it. `ContentCacheRetentionTest` asserts the relationship rather than the numbers.
 
 ### MIME spoofing
 
@@ -211,9 +264,28 @@ for an APK, and a sender may declare `text/plain` for something named `payload.a
 Open and Share hand the file to another app through a `FileProvider` content URI with a temporary
 read grant, never a `file://` URI. The provider is `exported="false"` with
 `grantUriPermissions="true"`, so it is unreachable except through a URI this app explicitly grants.
-Its `file_provider_paths.xml` is scoped to the two cache subdirectories the transfer code writes,
-not the whole cache and not external storage: a provider rooted at `.` would turn any traversal
-that got past the sanitiser into a readable URI for arbitrary app-private data.
+Its `file_provider_paths.xml` exposes exactly one directory — `ready/`, the verified complete
+files — and not the whole cache, not external storage, and **not** the `incoming/` staging
+directory. A provider rooted at `.` would turn any traversal that got past the sanitiser into a
+readable URI for arbitrary app-private data.
+
+`incoming/` was removed from that file rather than kept for a hypothetical resume. A partial has
+not passed its hash check, so its bytes are whatever the peer sent; granting a URI to one would
+hand another app a half-written file that failed integrity checking. Nothing in the app needs to
+read a partial back through a content URI, because the receiver holds its own `File` handle while
+writing.
+
+The declared path must include the cache's own container directory (`relay_cache/ready/`), not just
+`ready/`. It said the latter for a while, which matched nothing, so the first real `getUriForFile`
+call threw and took the app down — a crash rather than a leak, but it also meant the narrowing had
+never actually been exercised. `FileProviderPathTest` now asserts on a device that a file the cache
+wrote can be shared, that a partial cannot, and that the cache root is not exposed.
+
+Opening is always through `Intent.createChooser`, so the handler is the user's choice every time
+rather than a default set once, and `ACTION_INSTALL_PACKAGE` is never used. Verified on hardware:
+opening a received APK shows a warning, leaves the app in the foreground, and installs nothing. Saving out goes through
+`CreateDocument`: the user picks the destination and the app writes through the resolver, which is
+why no storage permission is needed on any API level.
 
 ### Partial-file cleanup
 
@@ -225,5 +297,14 @@ paths. Unclaimed files expire after 24 hours.
 
 ### No new permissions
 
-Selection is through the Storage Access Framework. No storage permission is requested, and
-`MANAGE_EXTERNAL_STORAGE` is neither declared nor needed.
+Selection is through the Storage Access Framework: `OpenMultipleDocuments` with `*/*`. The picker
+itself is the permission — the user chooses exactly which files this app may read and the system
+grants access to those URIs alone. Every byte is then read through the `ContentResolver`, and no
+filesystem path is ever derived from a URI.
+
+Consequently no storage permission is requested on any API level: no `READ_EXTERNAL_STORAGE`, no
+`READ_MEDIA_*`, and `MANAGE_EXTERNAL_STORAGE` is neither declared nor needed. Adding generic file
+transfer changed the manifest's permission set not at all — the declared permissions in
+`AndroidManifest.xml` are the same before and after. That is verified by reading the manifest, not
+by a build check: no Gradle task asserts it, and `verifyReleaseGuards` covers something else
+entirely (that every release-artifact task carries the signing guard).

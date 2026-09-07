@@ -38,6 +38,13 @@ import com.avinash.relaydisplay.ui.common.RelaySection
 import com.avinash.relaydisplay.ui.common.VerticalGap
 import com.avinash.relaydisplay.ui.navigation.SendFocus
 import com.avinash.relaydisplay.ui.relayViewModel
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextOverflow
+import com.avinash.relaydisplay.content.FileBatchState
+import com.avinash.relaydisplay.content.FilePhase
+import com.avinash.relaydisplay.content.FileProgress
+import com.avinash.relaydisplay.content.FileTransferPolicy
 
 /**
  * Everything the controller can put on the other screen.
@@ -80,6 +87,19 @@ fun SendScreen(
     }
     val pickPdf = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) viewModel.sendPickedFile(uri, ui.defaultFitMode)
+    }
+
+    // Any file, several at a time, through the Storage Access Framework.
+    //
+    // OpenMultipleDocuments and "*/*" on purpose: the picker itself is the permission. The user
+    // chooses exactly which files this app may read and the system grants access to those URIs
+    // alone, which is why the app holds no storage permission at all -- no READ_MEDIA_*, no
+    // READ_EXTERNAL_STORAGE, and certainly no MANAGE_EXTERNAL_STORAGE. Every byte is then read
+    // through the ContentResolver; no filesystem path is ever derived from a URI.
+    val pickFiles = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        viewModel.onFilesPicked(uris)
     }
 
     Column(modifier.fillMaxSize()) {
@@ -172,6 +192,15 @@ fun SendScreen(
                         )
                     }
                 }
+            }
+            VerticalGap()
+
+            RelaySection("Files") {
+                FileSendSection(
+                    ui = ui,
+                    viewModel = viewModel,
+                    onPick = { pickFiles.launch(arrayOf("*/*")) },
+                )
             }
             VerticalGap()
 
@@ -409,8 +438,9 @@ private fun BrightnessControl(enabled: Boolean, onSet: (Int) -> Unit) {
     )
 }
 
+/** Shared with FileSendSection, which renders the same kinds of message. */
 @Composable
-private fun Notice(text: String, error: Boolean = false, warning: Boolean = false) {
+internal fun Notice(text: String, error: Boolean = false, warning: Boolean = false) {
     Text(
         text = text,
         style = MaterialTheme.typography.bodyMedium,

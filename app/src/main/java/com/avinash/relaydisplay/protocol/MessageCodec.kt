@@ -147,6 +147,17 @@ object MessageCodec {
                 w.putString(5, m.displayName)
                 w.putBytes(6, m.sha256)
             }
+            is FileBatchOffer -> {
+                w.putBytes(1, uuidToBytes(m.batchId))
+                w.putString(2, m.senderName)
+                w.putU8(3, m.files.size)
+                w.putBytes(4, encodeManifest(m.files))
+            }
+            is FileBatchAccept -> w.putBytes(1, uuidToBytes(m.batchId))
+            is FileBatchReject -> {
+                w.putBytes(1, uuidToBytes(m.batchId))
+                w.putU16(2, m.errorCode.code)
+            }
             is ContentAccept -> w.putBytes(1, uuidToBytes(m.transferId))
             is ContentReject -> {
                 w.putBytes(1, uuidToBytes(m.transferId))
@@ -306,6 +317,25 @@ object MessageCodec {
             displayName = t.string(5, ContentLimits.MAX_FILENAME_BYTES),
             sha256 = exactly(t.bytes(6, SHA256_BYTES), SHA256_BYTES, "sha256"),
         )
+        MessageType.FILE_BATCH_OFFER -> {
+            val declaredCount = t.u8(3)
+            if (declaredCount < 1 || declaredCount > ContentLimits.MAX_FILES_PER_BATCH) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "batch file count out of range")
+            }
+            val files = decodeManifest(t.bytes(4, MAX_MANIFEST_BYTES), declaredCount)
+            FileBatchOffer(
+                id = id,
+                batchId = uuidFromBytes(t.bytes(1, 16), 0),
+                senderName = t.string(2, ContentLimits.MAX_DEVICE_NAME_BYTES),
+                files = files,
+            )
+        }
+        MessageType.FILE_BATCH_ACCEPT -> FileBatchAccept(id, uuidFromBytes(t.bytes(1, 16), 0))
+        MessageType.FILE_BATCH_REJECT -> FileBatchReject(
+            id = id,
+            batchId = uuidFromBytes(t.bytes(1, 16), 0),
+            errorCode = ProtocolErrorCode.fromCode(t.u16(2)),
+        )
         MessageType.CONTENT_ACCEPT -> ContentAccept(id, uuidFromBytes(t.bytes(1, 16), 0))
         MessageType.CONTENT_REJECT -> ContentReject(
             id = id,
@@ -464,6 +494,106 @@ object MessageCodec {
 
     @Suppress("unused")
     private fun utf8(s: String) = s.toByteArray(StandardCharsets.UTF_8)
+
+    /**
+     * Ceiling on the encoded manifest.
+     *
+     * MAX_FILES_PER_BATCH entries, each at worst a full-length name, a full-length MIME type, the
+     * two length prefixes and an eight-byte size. Bounded before a single byte is parsed, so a
+     * hostile length prefix cannot make the decoder allocate.
+     */
+    private val MAX_MANIFEST_BYTES: Int =
+        ContentLimits.MAX_FILES_PER_BATCH *
+            (2 + ContentLimits.MAX_FILENAME_BYTES + 2 + ContentLimits.MAX_MIME_BYTES + 8)
+
+    /**
+     * Packs the file list into one TLV field.
+     *
+     * The TLV layer keys fields by tag in a map, so it has no repeated fields and a list needs a
+     * nested encoding. Each entry is `u16 nameLen | name | u16 mimeLen | mime | i64 size`, in the
+     * order the files will be sent -- that order is part of the meaning, because the receiver's
+     * "3 of 7" counts against it.
+     */
+    private fun encodeManifest(files: List<FileManifestEntry>): ByteArray {
+        val out = java.io.ByteArrayOutputStream(files.size * 96)
+        for (file in files) {
+            val name = file.displayName.toByteArray(StandardCharsets.UTF_8)
+            val mime = file.mimeType.toByteArray(StandardCharsets.UTF_8)
+            // These are our own values and already validated, so a violation here is a bug on
+            // this side, not a malformed peer frame.
+            require(name.size <= ContentLimits.MAX_FILENAME_BYTES) { "name too long to encode" }
+            require(mime.size <= ContentLimits.MAX_MIME_BYTES) { "mime too long to encode" }
+            out.write((name.size ushr 8) and 0xFF)
+            out.write(name.size and 0xFF)
+            out.write(name)
+            out.write((mime.size ushr 8) and 0xFF)
+            out.write(mime.size and 0xFF)
+            out.write(mime)
+            for (shift in 56 downTo 0 step 8) {
+                out.write(((file.sizeBytes ushr shift) and 0xFF).toInt())
+            }
+        }
+        return out.toByteArray()
+    }
+
+    /**
+     * Unpacks a manifest sent by a peer.
+     *
+     * Everything here is untrusted. Every length is checked against both the remaining buffer and
+     * the per-field limit before it is used, the entry count must match what the header declared,
+     * and trailing bytes are a hard error rather than something to ignore -- a decoder that
+     * tolerates junk it does not understand is how one side's idea of a frame drifts from the
+     * other's.
+     */
+    private fun decodeManifest(raw: ByteArray, expectedCount: Int): List<FileManifestEntry> {
+        val files = ArrayList<FileManifestEntry>(expectedCount)
+        var offset = 0
+
+        fun need(count: Int) {
+            if (count < 0 || offset + count > raw.size) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "truncated batch manifest")
+            }
+        }
+
+        fun readU16(): Int {
+            need(2)
+            val value = ((raw[offset].toInt() and 0xFF) shl 8) or (raw[offset + 1].toInt() and 0xFF)
+            offset += 2
+            return value
+        }
+
+        fun readText(maxBytes: Int, what: String): String {
+            val length = readU16()
+            if (length > maxBytes) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "batch $what too long")
+            }
+            need(length)
+            val text = String(raw, offset, length, StandardCharsets.UTF_8)
+            offset += length
+            return text
+        }
+
+        repeat(expectedCount) {
+            val name = readText(ContentLimits.MAX_FILENAME_BYTES, "name")
+            val mime = readText(ContentLimits.MAX_MIME_BYTES, "mime type")
+            need(8)
+            var size = 0L
+            for (i in 0 until 8) {
+                size = (size shl 8) or (raw[offset + i].toLong() and 0xFF)
+            }
+            offset += 8
+            // A negative size cannot be legitimate: sizes are measured, and the sentinel for
+            // "unknown" never travels. Bounding it here means nothing downstream has to.
+            if (size < 0 || size > ContentLimits.MAX_FILE_BYTES) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "batch entry size out of range")
+            }
+            files.add(FileManifestEntry(displayName = name, mimeType = mime, sizeBytes = size))
+        }
+        if (offset != raw.size) {
+            protocolError(ProtocolErrorCode.MALFORMED_FRAME, "trailing bytes in batch manifest")
+        }
+        return files
+    }
 }
 
 /** Capability tokens advertised in [Hello]. Unknown tokens from a peer are ignored, not fatal. */

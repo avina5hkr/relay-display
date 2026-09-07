@@ -6,6 +6,9 @@ import com.avinash.relaydisplay.protocol.ContentAccept
 import com.avinash.relaydisplay.protocol.ContentOffer
 import com.avinash.relaydisplay.protocol.ContentReject
 import com.avinash.relaydisplay.protocol.ErrorMessage
+import com.avinash.relaydisplay.protocol.FileBatchOffer
+import com.avinash.relaydisplay.protocol.FileBatchAccept
+import com.avinash.relaydisplay.protocol.FileBatchReject
 import com.avinash.relaydisplay.protocol.MirrorConfig
 import com.avinash.relaydisplay.protocol.MirrorFrame
 import com.avinash.relaydisplay.protocol.MirrorKeyframeRequest
@@ -85,11 +88,33 @@ fun RelayMessage.trafficClass(): TrafficClass = when (this) {
     // Content that is small and must arrive: the display cannot show text it never received.
     is ShowText, is ShowQr, is ShowLink, is ShowFile -> TrafficClass.CONTROL
 
-    // Transfer negotiation is control; the bytes themselves are bulk.
+    // Transfer negotiation is control; the bytes themselves are bulk. Batch confirmation belongs
+    // with the negotiation: it is three small messages that gate everything after them, and a
+    // dropped accept would strand the sender waiting on a decision the user already made.
+    //
+    // TransferStart is safe here even though the chunks it introduces are BULK: control overtaking
+    // it can only make it arrive *earlier*, and it has to precede the chunks anyway.
     is ContentOffer, is ContentAccept, is ContentReject,
-    is TransferStart, is TransferComplete, is TransferCancel,
+    is TransferStart, is TransferCancel,
+    is FileBatchOffer, is FileBatchAccept, is FileBatchReject,
     -> TrafficClass.CONTROL
-    is TransferChunk -> TrafficClass.BULK
+
+    // File bodies. Backpressured, so a slow display slows the sender rather than filling its heap,
+    // and never able to starve the control queue.
+    //
+    // TransferComplete rides the SAME queue, and that is not a detail. The writer is strict
+    // priority: anything on CONTROL is written before anything on BULK. A completion on CONTROL
+    // therefore overtakes chunks still sitting in the bulk queue, and the receiver -- which
+    // requires chunks in order and checks the byte count before the digest -- rejects the transfer
+    // with a short count for a file that was never actually corrupt.
+    //
+    // Found on hardware, not by inspection: a 19 MB APK arrived as exactly 301 of 304 chunks
+    // (19726336 of 19910151 bytes) because the last three were still queued when the completion
+    // jumped ahead of them. Small transfers never show it, because BULK has no backlog to jump.
+    // Being on one FIFO queue with the chunks is what makes "complete" mean "after the bytes".
+    //
+    // TransferCancel deliberately stays on CONTROL: cancelling is *meant* to overtake the backlog.
+    is TransferChunk, is TransferComplete -> TrafficClass.BULK
 
     is MirrorFrame -> TrafficClass.MEDIA
 

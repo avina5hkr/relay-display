@@ -3,6 +3,7 @@ package com.avinash.relaydisplay
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -100,12 +101,31 @@ class DashboardChromeTest {
     @Test
     fun theSendTilesAreVisibleAndDisabledWhileDisconnected() {
         launchAs(DeviceRole.CONTROLLER)
-        // Six choices, all on screen, all labelled. Disabled because nothing is connected.
-        for (tag in listOf("tile_qr", "tile_text", "tile_link", "tile_image", "tile_pdf", "tile_mirror")) {
+        // Seven choices, all on screen, all labelled. Disabled because nothing is connected.
+        for (tag in listOf(
+            "tile_qr", "tile_text", "tile_link", "tile_image", "tile_pdf", "tile_files", "tile_mirror",
+        )) {
             compose.onNodeWithTag(tag).assertExists()
         }
         compose.onNodeWithContentDescription("QR code").assertExists()
         compose.onNodeWithContentDescription("Share screen").assertExists()
+    }
+
+    @Test
+    fun sendingFilesIsReachableFromTheDashboard() {
+        // The point of the tile: file sending used to be reachable only by opening the composer
+        // for some other kind of content first and scrolling past it, which nobody would find.
+        launchAs(DeviceRole.CONTROLLER)
+        compose.onNodeWithTag("tile_files").assertExists()
+        compose.onNodeWithContentDescription("Files").assertExists()
+    }
+
+    @Test
+    fun theFilesTileIsDisabledWhileDisconnected() {
+        // Disabled for two independent reasons while there is no session: nothing to send to, and
+        // no way to know yet whether the peer can receive files at all.
+        launchAs(DeviceRole.CONTROLLER)
+        compose.onNodeWithTag("tile_files").assertIsNotEnabled()
     }
 
     @Test

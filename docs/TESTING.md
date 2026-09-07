@@ -47,7 +47,7 @@ milliseconds rather than minutes.
 | `RoleSwitchCoordinatorTest` | 12 | persistence last, teardown order, repeated tap dropped, Switching then Completed, screen cleared, mode reset, On Demand starts nothing |
 | `LoopbackSessionTest` | 14 | full handshake and relay over an in-process transport, plus fault injection |
 
-**Total: 331 tests, all passing.**
+**Total at that point: 331 tests, all passing.** (See the current total below.)
 
 Three suites were added this round, each pinning a bug the two-device run found:
 `BrowseLeaseTest` (11) for the shared mDNS browse refcount, `ListenerShutdownTest` (3) for the
@@ -58,20 +58,119 @@ contract `RelayEngine.stop()` depends on, and four more `ConnectionStateMachineT
 
 | Suite | Tests | Covers |
 | --- | ---: | --- |
-| `FileTransferPolicyTest` | 21 | known/unknown/negative/zero sizes, per-file and batch limits at and over the boundary, MIME fallback, over-long and control-character MIME, unknown sizes excluded from batch totals, executable warning by MIME **and** extension including a mismatched declaration, case-insensitivity, image/PDF rules unchanged |
-| `ReceivedFilenameTest` | 15 | traversal (relative, absolute, Windows, traversal-only), no separator survives any hostile input, control characters, hostile characters, Windows device names, spaces/CJK/Cyrillic/emoji preserved, byte-limited truncation, truncation never splitting a code point |
-| `FileBatchStateTest` | 19 | initial state, known vs indeterminate totals, progress across files, percentage clamping, empty file as 100%, settling only when every phase is terminal, verifying not terminal, cancel keeping completed files, idempotent cancel, rejection, retryable vs non-retryable failure, no retry before settling, disconnect marking interrupted, retry-from-start resetting only the retried file |
+| `FileTransferPolicyTest` | 20 | per-file and batch limits at and over the boundary, MIME fallback, over-long and control-character MIME, executable warning by MIME **and** extension including a mismatched declaration, case-insensitivity, image/PDF rules unchanged |
+| `ReceivedFilenameTest` | 22 | traversal (relative, absolute, Windows, traversal-only), no separator survives any hostile input, control characters, hostile characters, Windows device names, spaces/CJK/Cyrillic/emoji preserved, both budgets applied together, the ~180-character ASCII `.pdf` regression, character cap with a generous byte cap and vice versa, over-long extension not reserved, truncation never splitting a code point |
+| `FileBatchStateTest` | 20 | initial state, known vs indeterminate totals, progress across files, percentage clamping, empty file as 100%, settling only when every phase is terminal, verifying not terminal, cancel keeping completed files, idempotent cancel, rejection, retryable vs non-retryable failure, no retry before settling, disconnect marking interrupted, retry-from-start resetting only the retried file |
 | `GenericFileReceiveTest` | 19 | end-to-end accept/verify/promote, any MIME, empty file, APK transferred but flagged, digest mismatch, out-of-order chunk, duplicate chunk index, wrong transfer id, truncated finish, overflow beyond declared size, size limit, negative size, chunk size beyond the frame limit, size changed between offer and start, cancellation cleanup, hostile filename, capability versioning, old-peer refusal |
+| `FileBatchManifestTest` | 14 | manifest round-trip with order preserved, a full 20-file batch, multi-byte names, empty MIME, and the hostile cases: truncated mid-manifest, trailing bytes, empty batch, over the file limit, negative size, size over the per-file limit, two `Long.MAX_VALUE` sizes, an inflated name-length prefix, encoding stability |
+| `ContentPreparationTest` | 12 | measured size and digest describing the same bytes, unknown declared size resolved, over- and under-reported sizes corrected, empty file, source read exactly once, limit enforced during the read rather than from the declaration, exactly-at-limit accepted, read failure reported, digest equality by content |
+| `ContentCacheRetentionTest` | 18 | the retention invariant, budgets matching policy, a full batch surviving receipt, name/type persistence across instances, missing sidecar, sidecar whose size disagrees with the file, a sidecar attempting a path in the display name, sidecars excluded from budgets, oldest-first eviction taking sidecars, byte-budget eviction, expiry in and out of the window, partial sweeping, deletion, extension fallback |
+| `IncomingBatchTest` | 13 | totals including all-empty and worst-legal-case (no overflow), executable detection by extension and by MIME including disguises, "apk" as a substring not tripping it, hostile name sanitised before it reaches a screen, batch refusals for count/bytes/empty/overflowing totals |
 
-**74 new tests, 418 total, 0 failures.**
+**Unit tests: 486 run, 0 failures** (up from 418).
 
-Not covered, because the code does not exist yet: picker and multi-select result handling,
-selection review, incoming prompt, accept/reject, progress and cancellation UI, completed-file
-actions, no-handler error on open, back/close behaviour. No instrumentation test was added for
-file transfer for the same reason — there is nothing to drive.
+Four of those were added after hardware testing, in `OutboundPriorityTest`: they pin the traffic
+class of `TransferComplete`, `TransferCancel`, `TransferStart` and the three batch messages. See
+"Two bugs the device found" below.
 
-**No two-device file-transfer test has been run.** No device was attached, and there is no
-end-to-end path to exercise: nothing in the app offers a way to select a file.
+### Instrumentation tests, on hardware
+
+`FileTransferUiTest`, 13 tests: the About screen rendering its mark; the incoming prompt naming
+the sender, every file and every size; accept and reject each reporting exactly once; the
+executable call-out; the received-files empty state; all four per-file actions present; delete
+asking first and only reporting after confirmation; Keep cancelling it; an APK warning before
+anything leaves the app; an ordinary file not warning; type and size per row; one row per file.
+
+`FileProviderPathTest`, 4 tests: that a file the cache wrote can actually be turned into a
+`content://` URI, that the URI reads back the right bytes, that a partial in `incoming/` cannot be
+shared, and that the cache root is not exposed.
+
+| Device | Full suite |
+| --- | --- |
+| Lenovo K33a42, Android 7.0 (API 24) | **OK (50 tests)** |
+| Samsung SM-S908E, Android 16 (API 36) | **OK (50 tests)** |
+
+Run with `adb shell am instrument -w -r com.avinash.relaydisplay.test/androidx.test.runner.AndroidJUnitRunner`
+after installing both APKs.
+
+**Do not trust `connectedDebugAndroidTest`'s summary on its own.** On this setup it printed
+`BUILD SUCCESSFUL` while running **zero** tests and writing a report that says "0 tests, 0
+failures" — a false pass, twice. The `am instrument` output above is what was actually believed.
+It is also worth knowing that `connectedDebugAndroidTest` *uninstalls* the app first, which will
+wipe a release-signed install and its data.
+
+The About-screen test is the regression test for a real crash: `AboutScreen` rendered
+`painterResource(R.mipmap.ic_launcher)`, which on API 26+ resolves to
+`mipmap-anydpi-v26/ic_launcher.xml` — an `<adaptive-icon>`, which `painterResource` cannot inflate.
+Opening About therefore threw on every modern phone. No unit test could see it, because the failure
+is in resource inflation on a device.
+
+### Two-device file transfer, on hardware
+
+Controller: Samsung SM-S908E (API 36). Display: Lenovo K33a42 (API 24). Both on Wi-Fi, paired.
+
+| Case | Result |
+| --- | --- |
+| **Files** tile on the dashboard, disabled while disconnected | Pass |
+| Files tile opens the picker; review list appears on the dashboard in place | Pass |
+| Sending from the dashboard: 2 files, "2 of 2 sent", each row "sent" | Pass |
+| Files action visible and enabled when connected on the Send screen | Pass |
+| SAF multi-select, 4 files chosen, `*/*` | Pass |
+| Review list: name, MIME, size per file; total "4 file(s), 487 B" | Pass |
+| Remove one file: count and total recalculated to "3 file(s)" | Pass |
+| Display prompt: sender name, count, total, every name and size | Pass |
+| Accept all, then 3 files transferred and verified | Pass, ~450 ms |
+| **A 0-byte file transfers and lands as 0 bytes** | Pass |
+| **A 180-character ASCII `.pdf` arrives as 120 characters, still `.pdf`** | Pass |
+| Files named from transfer UUID on disk, never from the peer's name | Pass |
+| No partial left in `incoming/` after success | Pass |
+| Received list: newest first, name/MIME/size, four actions each | Pass |
+| List survives force-stop and relaunch (metadata sidecar) | Pass |
+| Status honestly reads "Not connected" after the process restart | Pass |
+| Reconnect after reinstall without re-pairing | Pass |
+| Open a PDF: opens in an external viewer through a `content://` URI | Pass |
+| An APK batch: prompt shows the executable call-out | Pass |
+| A 19.9 MB APK transfers and verifies | Pass, ~8 s (**after a fix; see below**) |
+| Open an APK: warns first, app stays foreground, nothing installed | Pass |
+| Cancel on that warning: file untouched, nothing installed | Pass |
+| Delete: asks first, then removes payload **and** sidecar, no orphan | Pass |
+| Save as: `CreateDocument`, name pre-filled from the sidecar, file written | Pass |
+
+Not exercised on hardware: Share (the chooser path is the same code as Open, which was), cancelling
+a transfer mid-flight, retry after a real failure, a batch running concurrently with an active
+mirror, and the 20-file/200 MiB limits at their boundaries.
+
+### Two bugs the device found
+
+Neither was reachable by inspection or by any unit test, and both are the reason this section
+exists rather than a claim that the feature works.
+
+**1. The FileProvider path never matched the cache layout.** `file_provider_paths.xml` declared
+`path="ready/"`, which resolves to `<cacheDir>/ready/`, while `ContentCache` writes to
+`<cacheDir>/relay_cache/ready/`. The first real `getUriForFile` call threw
+`IllegalArgumentException: Failed to find configured root that contains ...` and took the app down
+on the first tap of "Open". It had gone unnoticed because nothing exercised the provider until
+these actions existed. Fixed by declaring the full path; `FileProviderPathTest` now fails if the
+two drift apart again, and the intent helpers turn a provider misconfiguration into a message
+rather than a crash.
+
+**2. A transfer completion could overtake its own final chunks.** `TransferChunk` is `BULK` and
+`TransferComplete` was `CONTROL`, and the session writer is strict priority: control before bulk.
+For a large file the completion therefore jumped ahead of chunks still queued, and the receiver —
+which requires chunks in order and checks the byte count before the digest — rejected a file that
+was never corrupt. A 19.9 MB APK arrived as exactly 301 of 304 chunks (19,726,336 of 19,910,151
+bytes). Small transfers never reproduce it, because `BULK` has no backlog to jump. Fixed by putting
+`TransferComplete` on the same FIFO queue as the chunks, which is what makes "complete" mean "after
+the bytes". `TransferCancel` deliberately stays on `CONTROL`, because cancelling is meant to
+overtake the backlog.
+
+Both failures were silent on the sending side, which reported only "the display could not verify
+the file". The receiver now logs which rule was broken — byte count, digest, or storage — because
+it is the only side that knows.
+
+The end-to-end path **has** now been exercised on the two phones, which is what found both bugs
+above. What remains unverified is listed under "Not exercised on hardware".
+
 
 ### Fault injection
 

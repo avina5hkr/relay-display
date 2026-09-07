@@ -58,6 +58,7 @@ enum class RelayIcon {
     LINK,
     IMAGE,
     DOCUMENT,
+    FILES,
     SCREEN_SHARE,
     CLOSE,
     COPY,
@@ -80,6 +81,7 @@ fun RelayGlyph(
             RelayIcon.LINK -> drawLink(tint)
             RelayIcon.IMAGE -> drawImage(tint)
             RelayIcon.DOCUMENT -> drawDocument(tint)
+            RelayIcon.FILES -> drawFiles(tint)
             RelayIcon.SCREEN_SHARE -> drawScreenShare(tint)
             RelayIcon.CLOSE -> drawClose(tint)
             RelayIcon.COPY -> drawCopy(tint)
@@ -180,6 +182,67 @@ private fun DrawScope.drawImage(tint: Color) {
 }
 
 /** A page with a folded corner. */
+/**
+ * Two offset sheets: several files, not one document.
+ *
+ * Deliberately different from [drawDocument], which the PDF tile already uses. The two tiles sit
+ * next to each other, so if this were the same glyph with a different label the grid would stop
+ * being scannable by shape -- which is the whole reason it is a grid of shapes. A folder was the
+ * other candidate and was rejected: the action picks files, not a directory, and a folder implies
+ * browsing somewhere this app never goes.
+ *
+ * No fold corner on the back sheet: at 30dp on the Lenovo the two folds collided into noise, the
+ * same failure the link glyph had. The back sheet is a plain offset rectangle and the front one
+ * carries the fold, which is enough to read as a stack.
+ */
+private fun DrawScope.drawFiles(tint: Color) {
+    val w = stroke()
+    val offset = size.width * 0.16f
+    val left = size.width * 0.14f
+    val right = size.width * 0.72f
+    val top = size.height * 0.1f
+    val bottom = size.height * 0.72f
+    val fold = size.width * 0.2f
+
+    // Back sheet, up and to the right.
+    drawPath(
+        androidx.compose.ui.graphics.Path().apply {
+            moveTo(left + offset, top)
+            lineTo(right + offset, top)
+            lineTo(right + offset, bottom)
+        },
+        tint,
+        style = Stroke(width = w, cap = StrokeCap.Round),
+    )
+
+    // Front sheet, with the fold that says "document".
+    val fl = left
+    val fr = right
+    val ft = top + offset
+    val fb = bottom + offset
+    drawPath(
+        androidx.compose.ui.graphics.Path().apply {
+            moveTo(fl, ft)
+            lineTo(fr - fold, ft)
+            lineTo(fr, ft + fold)
+            lineTo(fr, fb)
+            lineTo(fl, fb)
+            close()
+        },
+        tint,
+        style = Stroke(width = w),
+    )
+    drawPath(
+        androidx.compose.ui.graphics.Path().apply {
+            moveTo(fr - fold, ft)
+            lineTo(fr - fold, ft + fold)
+            lineTo(fr, ft + fold)
+        },
+        tint,
+        style = Stroke(width = w),
+    )
+}
+
 private fun DrawScope.drawDocument(tint: Color) {
     val w = stroke()
     val left = size.width * 0.2f

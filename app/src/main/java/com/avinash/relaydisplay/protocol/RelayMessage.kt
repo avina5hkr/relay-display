@@ -292,6 +292,55 @@ data class ShowFile(
     override val type get() = MessageType.SHOW_FILE
 }
 
+/**
+ * One file's metadata inside a [FileBatchOffer].
+ *
+ * No transfer id: ids are allocated per file when that file's own CONTENT_OFFER goes out. This is
+ * a manifest for the confirmation dialog, not a transfer handle.
+ */
+data class FileManifestEntry(
+    val displayName: String,
+    val mimeType: String,
+    /**
+     * Measured, never declared.
+     *
+     * The sender runs a preparation pass before offering, so this is the real length of the bytes
+     * that will arrive. There is deliberately no "unknown" sentinel on the wire: an unknown size
+     * is resolved on the sending side, so the receiver can always show a real total and check it
+     * against its own limits.
+     */
+    val sizeBytes: Long,
+)
+
+/**
+ * Controller -> Display: the whole selection, for a single confirmation.
+ *
+ * Carries the sender's own name so the Display can say who is asking without having to correlate
+ * against connection state at dialog time.
+ */
+data class FileBatchOffer(
+    override val id: UUID,
+    val batchId: UUID,
+    val senderName: String,
+    val files: List<FileManifestEntry>,
+) : RelayMessage {
+    override val type get() = MessageType.FILE_BATCH_OFFER
+
+    val totalBytes: Long get() = files.sumOf { it.sizeBytes }
+}
+
+data class FileBatchAccept(override val id: UUID, val batchId: UUID) : RelayMessage {
+    override val type get() = MessageType.FILE_BATCH_ACCEPT
+}
+
+data class FileBatchReject(
+    override val id: UUID,
+    val batchId: UUID,
+    val errorCode: ProtocolErrorCode,
+) : RelayMessage {
+    override val type get() = MessageType.FILE_BATCH_REJECT
+}
+
 data class PdfPageCommand(
     override val id: UUID,
     val transferId: UUID,

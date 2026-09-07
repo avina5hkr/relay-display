@@ -77,7 +77,7 @@ controller in dark theme, and a Lenovo K33a42 as the display in light theme.
 | 🔗 | **Links** | Validated before sending; the display shows the destination rather than opening it behind your back. |
 | 🖼 | **Images** | JPEG, PNG, WebP, GIF, HEIF. Up to 50 MiB, streamed and SHA-256 verified. |
 | 📄 | **PDFs** | Page through them from the controller. |
-| 📁 | **Generic files** | Protocol and validation implemented; **no user interface yet**, so not reachable from the app. See [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md). |
+| 📁 | **Generic files** | Send any file, several at a time, from the **Files** tile on the dashboard (or the Send screen). The receiving phone confirms the whole batch before anything is written, then each file can be opened, saved, shared or deleted. Auto-accept is deliberately not offered. See [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md). |
 | 🖥 | **Screen mirroring** | The controller's screen as live H.264 video. |
 | 🎛 | **Remote control of that screen** | Blank it, return to the waiting screen, fit/fill, in-app brightness, full screen, rotate, page a PDF. |
 | 📋 | **Copy on the display** | Text, a QR payload or a link goes to the display phone's clipboard. |

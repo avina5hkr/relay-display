@@ -6,6 +6,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.avinash.relaydisplay.app.AppContainer
 import com.avinash.relaydisplay.content.ContentRouter
+import com.avinash.relaydisplay.content.FileBatchState
+import com.avinash.relaydisplay.content.FileTransferPolicy
+import com.avinash.relaydisplay.protocol.Capabilities
+import com.avinash.relaydisplay.content.ContentSource
 import com.avinash.relaydisplay.content.ContentSourceError
 import com.avinash.relaydisplay.content.ContentSourceResult
 import com.avinash.relaydisplay.content.QrEncodeError
@@ -45,8 +49,35 @@ data class SendUiState(
     val fileError: String? = null,
     val notice: String? = null,
     val defaultFitMode: FitMode = FitMode.DEFAULT,
+    /** Files chosen but not yet offered. The review list. */
+    val picked: List<PickedFile> = emptyList(),
+    /** The multi-file send in flight, or null. */
+    val fileBatch: FileBatchState? = null,
+    val batchError: String? = null,
 ) {
     val connected: Boolean get() = connection.isConnected
+
+    /**
+     * Whether the other phone announced generic file transfer.
+     *
+     * Drives whether the Files action is offered at all, so the refusal is visible before the
+     * user picks twenty files rather than after.
+     */
+    val peerSupportsFiles: Boolean
+        get() = (connection as? ConnectionState.Connected)
+            ?.peer
+            ?.capabilities
+            ?.contains(Capabilities.FILE_V1) == true
+
+    val canSendPicked: Boolean get() = connected && picked.isNotEmpty() && fileBatch == null
+
+    /** Total of the selection, or null when any provider would not report a size. */
+    val pickedTotalBytes: Long?
+        get() = if (picked.any { it.sizeBytes == FileTransferPolicy.SIZE_UNKNOWN }) {
+            null
+        } else {
+            picked.sumOf { it.sizeBytes }
+        }
     val canSend: Boolean get() = connected && draft.isNotBlank()
 
     /** Only offered when the Display says it actually has something on screen. */
@@ -70,6 +101,14 @@ data class SendUiState(
         }
 }
 
+/** One file in the review list, before anything is offered. */
+data class PickedFile(
+    val displayName: String,
+    val mimeType: String,
+    /** May be [FileTransferPolicy.SIZE_UNKNOWN]: the real size is measured at send time. */
+    val sizeBytes: Long,
+)
+
 /**
  * The controller's send actions.
  *
@@ -86,6 +125,16 @@ class SendViewModel(
 
     private val draft = MutableStateFlow("")
     private val messages = MutableStateFlow(Messages())
+    private val picked = MutableStateFlow<List<PickedFile>>(emptyList())
+
+    /**
+     * The sources behind [picked], in the same order.
+     *
+     * Kept out of the UI state deliberately: a `ContentSource` holds a resolver and a URI, which
+     * is machinery, not something a screen should be handed. The two lists are only ever mutated
+     * together, which is why the removal helper below rebuilds both.
+     */
+    private var pickedSources: List<ContentSource> = emptyList()
 
     private data class Messages(
         val qrWarning: String? = null,
@@ -93,6 +142,7 @@ class SendViewModel(
         val linkError: String? = null,
         val fileError: String? = null,
         val notice: String? = null,
+        val batchError: String? = null,
     )
 
     val uiState: StateFlow<SendUiState> = combine(
@@ -102,6 +152,8 @@ class SendViewModel(
         messages,
         settingsRepository.settings,
         router.remotePresentation,
+        picked,
+        router.fileBatch,
     ) { values ->
         @Suppress("UNCHECKED_CAST")
         val connection = values[0] as ConnectionState
@@ -111,6 +163,9 @@ class SendViewModel(
         val msg = values[3] as Messages
         val settings = values[4] as com.avinash.relaydisplay.data.settings.RelaySettings
         val remote = values[5] as RemotePresentationState
+        @Suppress("UNCHECKED_CAST")
+        val pickedFiles = values[6] as List<PickedFile>
+        val batch = values[7] as FileBatchState?
         SendUiState(
             connection = connection,
             sendState = sendState,
@@ -122,6 +177,9 @@ class SendViewModel(
             fileError = msg.fileError,
             notice = msg.notice,
             defaultFitMode = settings.defaultFitMode,
+            picked = pickedFiles,
+            fileBatch = batch,
+            batchError = msg.batchError,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SendUiState())
 
@@ -236,6 +294,121 @@ class SendViewModel(
                 }
             }
         }
+    }
+
+    // -- generic files ---------------------------------------------------------------------
+
+    /**
+     * Resolves what the user picked into a review list.
+     *
+     * Nothing is sent here. The user sees names, types and sizes and confirms, because a
+     * multi-select picker makes it very easy to select more, or other, files than intended.
+     */
+    fun onFilesPicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            val resolved = withContext(Dispatchers.IO) {
+                uris.map { it to UriContentSource.forGenericFile(resolver, it) }
+            }
+            val sources = pickedSources.toMutableList()
+            val display = picked.value.toMutableList()
+            var rejected = 0
+            var tooLarge = 0
+
+            for ((_, result) in resolved) {
+                when (result) {
+                    is ContentSourceResult.Ready -> {
+                        if (sources.size >= FileTransferPolicy.MAX_FILES_PER_BATCH) {
+                            rejected++
+                            continue
+                        }
+                        sources += result.source
+                        display += PickedFile(
+                            displayName = result.source.displayName,
+                            mimeType = result.source.mimeType,
+                            sizeBytes = result.source.sizeBytes,
+                        )
+                    }
+                    is ContentSourceResult.Failed -> {
+                        if (result.error == ContentSourceError.TOO_LARGE) tooLarge++ else rejected++
+                    }
+                }
+            }
+
+            pickedSources = sources
+            picked.value = display
+            messages.value = messages.value.copy(
+                batchError = when {
+                    tooLarge > 0 && rejected > 0 ->
+                        "$tooLarge file(s) are over the 50 MB limit and $rejected could not be read " +
+                            "or would exceed ${FileTransferPolicy.MAX_FILES_PER_BATCH} files."
+                    tooLarge > 0 -> "$tooLarge file(s) are larger than the 50 MB limit."
+                    rejected > 0 ->
+                        "$rejected file(s) could not be read, or would take the batch over " +
+                            "${FileTransferPolicy.MAX_FILES_PER_BATCH} files."
+                    else -> null
+                },
+            )
+        }
+    }
+
+    /** Drops one file from the review list. */
+    fun removePickedFile(index: Int) {
+        if (index !in pickedSources.indices) return
+        pickedSources = pickedSources.filterIndexed { i, _ -> i != index }
+        picked.value = picked.value.filterIndexed { i, _ -> i != index }
+        messages.value = messages.value.copy(batchError = null)
+    }
+
+    /** Abandons the whole selection without sending it. */
+    fun clearPickedFiles() {
+        pickedSources = emptyList()
+        picked.value = emptyList()
+        messages.value = messages.value.copy(batchError = null)
+    }
+
+    /** Offers the selection to the other phone. */
+    fun sendPickedFiles() {
+        val sources = pickedSources
+        if (sources.isEmpty()) return
+        val refusal = router.sendFileBatch(sources)
+        if (refusal == null) {
+            // The review list has served its purpose; progress is reported from the batch state.
+            pickedSources = emptyList()
+            picked.value = emptyList()
+            messages.value = Messages()
+            return
+        }
+        diagnostics.info("send", "batch refused: $refusal")
+        messages.value = messages.value.copy(
+            batchError = when (refusal) {
+                FileTransferPolicy.SendRefusal.PeerTooOld ->
+                    "The other phone is running an older version of Relay Display that cannot " +
+                        "receive files. Update it on both phones and try again."
+                FileTransferPolicy.SendRefusal.NotConnected -> "Not connected."
+                is FileTransferPolicy.SendRefusal.Rejected -> refusal.reason
+            },
+        )
+    }
+
+    fun cancelFileBatch() = router.cancelFileBatch()
+
+    fun retryFileBatch() {
+        val refusal = router.retryFileBatch()
+        if (refusal != null) {
+            messages.value = messages.value.copy(
+                batchError = when (refusal) {
+                    FileTransferPolicy.SendRefusal.PeerTooOld -> "The other phone cannot receive files."
+                    FileTransferPolicy.SendRefusal.NotConnected -> "Not connected."
+                    is FileTransferPolicy.SendRefusal.Rejected -> refusal.reason
+                },
+            )
+        }
+    }
+
+    fun clearFileBatch() {
+        router.clearFileBatch()
+        messages.value = messages.value.copy(batchError = null)
     }
 
     fun cancelTransfer() {
