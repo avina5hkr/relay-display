@@ -77,6 +77,7 @@ controller in dark theme, and a Lenovo K33a42 as the display in light theme.
 | 🔗 | **Links** | Validated before sending; the display shows the destination rather than opening it behind your back. |
 | 🖼 | **Images** | JPEG, PNG, WebP, GIF, HEIF. Up to 50 MiB, streamed and SHA-256 verified. |
 | 📄 | **PDFs** | Page through them from the controller. |
+| 📁 | **Generic files** | Protocol and validation implemented; **no user interface yet**, so not reachable from the app. See [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md). |
 | 🖥 | **Screen mirroring** | The controller's screen as live H.264 video. |
 | 🎛 | **Remote control of that screen** | Blank it, return to the waiting screen, fit/fill, in-app brightness, full screen, rotate, page a PDF. |
 | 📋 | **Copy on the display** | Text, a QR payload or a link goes to the display phone's clipboard. |
@@ -438,6 +439,7 @@ design. Restarting the phone sometimes clears it.
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model, mitigations, residual risks |
 | [`docs/TESTING.md`](docs/TESTING.md) | Commands, per-suite coverage, the two-device acceptance matrix and its results |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | What is done, what is not, and why |
+| [`docs/BRANDING.md`](docs/BRANDING.md) | The logo concept, colours, safe-zone rules and how to regenerate the launcher assets |
 | [`docs/RELEASING.md`](docs/RELEASING.md) | Signing key handling, GitHub setup, the release process and the physical two-phone checklist |
 | [`diagnostics/FINDINGS.md`](diagnostics/FINDINGS.md) | Correlated two-device timelines from real-device debugging |
 
