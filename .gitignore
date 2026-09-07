@@ -47,6 +47,10 @@ local.properties
 *.tmp
 hs_err_pid*.log
 
+# Python bytecode from the branding icon generator.
+__pycache__/
+*.py[cod]
+
 # Other editors
 .vscode/
 *.swp
