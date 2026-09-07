@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 13+ themed icon. The system replaces the fill with its own colour pair, so this
+  must be a single colour silhouette. The foreground drawable cannot simply be reused: its
+  teal wedge would flatten into the white screens and the mark would become one blob.
+
+  The three forms stay separated by real gaps, which is what keeps the silhouette readable
+  once every shape is the same colour.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108"
+    android:tint="#FFFFFF">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M32.5,44.0 L38.5,44.0 A3.5,3.5 0 0 1 42.0,47.5 L42.0,60.5 A3.5,3.5 0 0 1 38.5,64.0 L32.5,64.0 A3.5,3.5 0 0 1 29.0,60.5 L29.0,47.5 A3.5,3.5 0 0 1 32.5,44.0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M67.0,36.0 L73.0,36.0 A5.0,5.0 0 0 1 78.0,41.0 L78.0,67.0 A5.0,5.0 0 0 1 73.0,72.0 L67.0,72.0 A5.0,5.0 0 0 1 62.0,67.0 L62.0,41.0 A5.0,5.0 0 0 1 67.0,36.0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M45.0,45.0 L59.5,54.0 L45.0,63.0 Z" />
+</vector>

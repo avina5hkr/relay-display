@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Android 12+ shows a system splash screen built from android:icon whether or not the app
+      configures one, so the launcher mark already appears there. This only sets the plate colour
+      behind it, so the splash matches the icon instead of defaulting to the theme window
+      background.
+
+      No androidx.core:core-splashscreen dependency: the platform API covers this on every version
+      that has a system splash screen, and on API 23 to 30 there is no system splash to style.
+    -->
+    <style name="Theme.RelayDisplay" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowSplashScreenBackground">@color/relay_icon_plate</item>
+    </style>
+</resources>

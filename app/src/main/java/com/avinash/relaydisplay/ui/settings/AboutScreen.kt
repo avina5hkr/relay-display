@@ -4,6 +4,10 @@ import android.content.Intent
 import android.content.res.AssetManager
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.layout.size
+import com.avinash.relaydisplay.R
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -136,7 +140,20 @@ private fun TabRow(selected: AboutTab, onSelect: (AboutTab) -> Unit) {
 @Composable
 private fun AboutTabContent(onBack: () -> Unit) {
     RelayCard {
-        Text("RelayDisplay", style = MaterialTheme.typography.titleLarge)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // The launcher mark, at text scale. Enough to tie the screen to the app's identity
+            // without turning an information screen into a splash page.
+            Image(
+                painter = painterResource(R.mipmap.ic_launcher),
+                contentDescription = null,
+                modifier = Modifier.size(40.dp),
+            )
+            Text(
+                "RelayDisplay",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(start = 12.dp),
+            )
+        }
         VerticalGap(RelayDimens.SmallGap)
         Text(
             "Turns a spare Android phone into a companion screen for another phone over Wi-Fi or " +

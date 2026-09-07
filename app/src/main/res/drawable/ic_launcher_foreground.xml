@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive launcher foreground: the Relay Display mark.
+  Two rounded screens, the controller you hold and the taller companion display, with a
+  relay wedge carrying content between them.
+
+  Every coordinate sits inside the 66dp safe circle centred on (54, 54), so no launcher
+  mask (circle, squircle, rounded square, teardrop) clips anything. That is asserted, not
+  assumed: running branding/generate_launcher_icons.py with the check flag fails if any
+  extreme point leaves the circle.
+
+  Generated from that same script, the single source of truth shared with
+  branding/relay-display-logo.svg. Do not hand edit these paths; change the script and
+  re-run it, or the two copies will disagree.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M32.5,44.0 L38.5,44.0 A3.5,3.5 0 0 1 42.0,47.5 L42.0,60.5 A3.5,3.5 0 0 1 38.5,64.0 L32.5,64.0 A3.5,3.5 0 0 1 29.0,60.5 L29.0,47.5 A3.5,3.5 0 0 1 32.5,44.0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M67.0,36.0 L73.0,36.0 A5.0,5.0 0 0 1 78.0,41.0 L78.0,67.0 A5.0,5.0 0 0 1 73.0,72.0 L67.0,72.0 A5.0,5.0 0 0 1 62.0,67.0 L62.0,41.0 A5.0,5.0 0 0 1 67.0,36.0 Z" />
+    <path
+        android:fillColor="#6FF6FE"
+        android:pathData="M45.0,45.0 L59.5,54.0 L45.0,63.0 Z" />
+</vector>
