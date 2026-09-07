@@ -13,7 +13,7 @@ composeBom = "2026.02.01"
 
 # Third party
 zxing = "3.5.4"
-coroutines = "1.10.2"
+coroutines = "1.11.0"
 desugarJdkLibs = "2.1.5"
 
 # Test
