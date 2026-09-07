@@ -1,0 +1,96 @@
+name: CI
+
+# Build and test on every change. This workflow deliberately has no access to signing secrets:
+# it never references the `release` environment, so even a malicious change to it cannot reach
+# the signing key.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches:
+      - main
+      - 'build/**'
+      - 'mirror-reliability'
+      - 'feature/**'
+      - 'fix/**'
+  workflow_dispatch:
+
+# Read-only by default. Nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+# One run per ref. A new push supersedes the previous run rather than queueing behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unit tests, lint and debug build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        # actions/setup-java v6.0.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          # JDK 25, not 17. gradle/gradle-daemon-jvm.properties pins toolchainVersion=25, so a
+          # JDK 17 runner would make Gradle download a 25 toolchain on every job. Matching the
+          # pin is faster and keeps CI identical to the developer machine.
+          java-version: '25'
+
+      - name: Set up Gradle
+        # gradle/actions v6.3.0 -- provides dependency caching and wrapper validation.
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          # Verifies gradle-wrapper.jar against the known-good checksums before it is executed.
+          validate-wrappers: true
+          # Only the default branch writes the cache; PR runs read it. A fork PR therefore cannot
+          # poison the cache for everyone else.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Validate version metadata
+        run: ./gradlew --no-daemon --stacktrace validateVersion
+
+      - name: Unit tests, lint, debug build, instrumentation compile
+        # assembleDebugAndroidTest only COMPILES the instrumentation tests. It does not run them;
+        # that needs a device or emulator and is tracked as a manual step in docs/RELEASING.md.
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            testDebugUnitTest \
+            lintDebug \
+            assembleDebug \
+            assembleDebugAndroidTest
+
+      - name: Upload reports on failure
+        if: failure()
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: reports-${{ github.run_id }}
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload debug APK (manual runs only)
+        # Only on workflow_dispatch, and named so nobody mistakes it for a release build. It IS
+        # signed with the debug key and must never be distributed.
+        if: github.event_name == 'workflow_dispatch'
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: DEBUG-SIGNED-NOT-FOR-DISTRIBUTION-${{ github.run_id }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+          if-no-files-found: error

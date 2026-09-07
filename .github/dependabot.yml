@@ -1,0 +1,72 @@
+version: 2
+
+updates:
+  # -------------------------------------------------------------------------------------------
+  # GitHub Actions
+  # -------------------------------------------------------------------------------------------
+  # Every action is pinned to a full commit SHA with the human-readable version in a trailing
+  # comment. Dependabot understands that convention: it bumps the SHA and rewrites the comment,
+  # so pinning does not mean going stale.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      # One PR for all routine action bumps rather than five. Major bumps still arrive
+      # separately, because an action major usually changes inputs.
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # -------------------------------------------------------------------------------------------
+  # Gradle dependencies
+  # -------------------------------------------------------------------------------------------
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      androidx-minor-patch:
+        patterns:
+          - "androidx.*"
+        update-types:
+          - minor
+          - patch
+      other-minor-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "androidx.*"
+          - "com.android.*"
+          - "org.jetbrains.kotlin*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # The toolchain majors are upgraded deliberately, together, and verified on both phones --
+      # never merged automatically. An AGP or Kotlin major can change codegen, R8 behaviour and
+      # the minSdk 23 desugaring this app depends on.
+      - dependency-name: "com.android.application"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "com.android.tools.build:gradle"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "org.jetbrains.kotlin*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "androidx.compose*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "androidx.compose:compose-bom"
+        update-types: ["version-update:semver-major"]
+
+# Deliberately absent: any auto-merge workflow. Every dependency change is reviewed and, for
+# anything touching the build or the mirroring path, smoke-tested on the two phones first.

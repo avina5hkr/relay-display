@@ -3,6 +3,104 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// -------------------------------------------------------------------------------------------
+// Version, from gradle.properties -- the single source of truth. See the notes there.
+// -------------------------------------------------------------------------------------------
+
+val appVersionName: String = providers.gradleProperty("APP_VERSION_NAME").get()
+
+/**
+ * versionCode, parsed with an intentional error message.
+ *
+ * A raw `.toInt()` gave a bare NumberFormatException pointing at Gradle internals. Passing a
+ * sentinel through to AGP was worse: AGP reports "versionCode is set to -1" while the file
+ * actually says something like `1.0`, which sends you looking in the wrong place.
+ *
+ * So this fails configuration immediately, naming the property and the offending value. An
+ * unparsable versionCode cannot produce a working build in any case, and this only affects a
+ * genuinely broken gradle.properties -- a normal checkout, with or without signing credentials,
+ * configures and syncs exactly as before.
+ */
+val rawVersionCode: String = providers.gradleProperty("APP_VERSION_CODE").get()
+val appVersionCode: Int = rawVersionCode.trim().toIntOrNull()
+    ?: throw GradleException(
+        "APP_VERSION_CODE in gradle.properties must be a positive integer, but is " +
+            "'${rawVersionCode.trim()}'.",
+    )
+
+/**
+ * Semantic version, optionally with a dotted prerelease suffix: 1.0.0 or 0.1.0-beta.1.
+ * Deliberately stricter than full semver -- build metadata (+sha) has no meaning for an Android
+ * versionName and would only create tags that do not match.
+ */
+val semVerPattern: String = """^\d+\.\d+\.\d+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$"""
+
+/**
+ * Fails the build on a malformed version rather than shipping one.
+ *
+ * Every release task depends on this. A bad versionName produces a tag nobody can match, and a
+ * bad versionCode is permanent once Play has seen it.
+ */
+val validateVersion = tasks.register("validateVersion") {
+    group = "verification"
+    description = "Checks APP_VERSION_NAME and APP_VERSION_CODE are well formed."
+    // Captured as plain values at configuration time. The regex is rebuilt inside the action
+    // rather than captured, because the configuration cache cannot serialise a script-level
+    // object reference.
+    val name = appVersionName
+    val code = appVersionCode
+    val rawCode = rawVersionCode
+    val pattern = semVerPattern
+    inputs.property("versionName", name)
+    inputs.property("versionCode", rawCode)
+    doLast {
+        if (!Regex(pattern).matches(name)) {
+            throw GradleException(
+                "APP_VERSION_NAME '$name' is not a semantic version. " +
+                    "Expected 1.0.0 or 0.1.0-beta.1.",
+            )
+        }
+        if (rawCode.trim().toIntOrNull() == null) {
+            throw GradleException(
+                "APP_VERSION_CODE in gradle.properties is not an integer: '$rawCode'.",
+            )
+        }
+        if (code < 1) {
+            throw GradleException("APP_VERSION_CODE must be a positive integer, got $code.")
+        }
+        logger.lifecycle("version $name (code $code), tag v$name")
+    }
+}
+
+/** True for 0.1.0-beta.1 and friends; drives prerelease vs stable in the release workflow. */
+val isPrerelease: Boolean = appVersionName.contains('-')
+
+// -------------------------------------------------------------------------------------------
+// Release signing, supplied only through the environment.
+// -------------------------------------------------------------------------------------------
+//
+// Nothing is hard-coded and no signing properties file is read, so there is no file that could be
+// committed by accident. Passwords arrive as environment variables rather than Gradle properties
+// because -P values appear in the process command line, which is world-readable on a shared
+// machine and is echoed by many CI systems.
+
+// providers.environmentVariable, not System.getenv: the configuration cache tracks provider
+// reads as inputs and invalidates when they change. A raw System.getenv at configuration time is
+// invisible to it, so a cache entry built without credentials is happily reused with them set --
+// which produces "Keystore file not set for signing config release" and looks like a signing bug.
+fun env(name: String): String? =
+    providers.environmentVariable(name).orNull?.takeIf { it.isNotBlank() }
+
+val releaseStorePath: String? = env("RELEASE_KEYSTORE_PATH")
+val releaseStorePassword: String? = env("RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = env("RELEASE_KEY_ALIAS")
+val releaseKeyPassword: String? = env("RELEASE_KEY_PASSWORD")
+
+/** All four present, or none. Anything between is a misconfiguration, not a build mode. */
+val signingInputs = listOf(releaseStorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
+val hasReleaseSigning = signingInputs.all { it != null }
+val hasPartialSigning = signingInputs.any { it != null } && !hasReleaseSigning
+
 android {
     namespace = "com.avinash.relaydisplay"
     compileSdk {
@@ -13,10 +111,28 @@ android {
         applicationId = "com.avinash.relaydisplay"
         minSdk = 23
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        // Only created when a complete set of credentials is present. When it is absent the
+        // release build type has no signingConfig at all, and the guard task below stops the
+        // build -- AGP would otherwise fall back to the debug key, which must never ship.
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStorePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                // Both schemes: v1 for the API 23 floor, v2+ for modern verification.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
     }
 
     buildTypes {
@@ -29,9 +145,10 @@ android {
             optimization {
                 enable = true
             }
-            // Release builds are unsigned here on purpose; both target phones install the debug
-            // APK. Add a signingConfig before publishing anywhere.
             isDebuggable = false
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
@@ -224,5 +341,143 @@ androidComponents {
             generateLicenseNotices,
             GenerateLicenseNotices::outputDir,
         )
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Release gates
+// -------------------------------------------------------------------------------------------
+
+/**
+ * Refuses to produce a release artefact without complete signing credentials.
+ *
+ * Without this, a missing environment variable produces an unsigned "release" that looks like a
+ * successful build and fails only when someone tries to install it -- or worse, an artefact signed
+ * with the debug key, which can never be updated by a properly signed one.
+ *
+ * The message names which inputs are missing but never their values.
+ */
+val requireReleaseSigning = tasks.register("requireReleaseSigning") {
+    group = "verification"
+    description = "Fails unless a complete release signing configuration is present."
+    val complete = hasReleaseSigning
+    val partial = hasPartialSigning
+    val missing = buildList {
+        if (releaseStorePath == null) add("RELEASE_KEYSTORE_PATH")
+        if (releaseStorePassword == null) add("RELEASE_KEYSTORE_PASSWORD")
+        if (releaseKeyAlias == null) add("RELEASE_KEY_ALIAS")
+        if (releaseKeyPassword == null) add("RELEASE_KEY_PASSWORD")
+    }
+    val storeExists = releaseStorePath?.let { File(it).isFile } ?: false
+    doLast {
+        if (partial) {
+            throw GradleException(
+                "Release signing is partially configured; missing: ${missing.joinToString(", ")}. " +
+                    "Supply all four or none -- a partial configuration must never silently " +
+                    "produce an unsigned release.",
+            )
+        }
+        if (!complete) {
+            throw GradleException(
+                "Release signing is not configured. Set ${missing.joinToString(", ")}. " +
+                    "Release builds are never signed with the debug key.",
+            )
+        }
+        if (!storeExists) {
+            // Path only. A path is not a credential, and naming it is the difference between a
+            // one-minute fix and an opaque failure.
+            throw GradleException("RELEASE_KEYSTORE_PATH does not point at a file.")
+        }
+    }
+}
+
+/**
+ * Every task that can emit a release APK or AAB, not just the aggregate lifecycle tasks.
+ *
+ * Guarding only `assembleRelease` and `bundleRelease` was bypassable, and demonstrably so:
+ * `./gradlew packageRelease` with no credentials produced `app-release-unsigned.apk`, and
+ * `./gradlew signReleaseBundle` produced an `.aab`. Both skipped the guard because it hung off
+ * the aggregate task rather than the one doing the work.
+ *
+ * This is task-name matching, which AGP does not officially bless. It is used because AGP 9.4
+ * exposes no public API for adding a dependency to the variant packaging or bundle-signing tasks
+ * -- `androidComponents.onVariants` can read and transform artifacts but cannot inject a
+ * precondition into `packageRelease`. Since the list is hand-maintained, `verifyReleaseGuards`
+ * below fails if AGP ever creates a release-artifact task that is not in it, so a toolchain
+ * upgrade cannot silently reopen the hole.
+ */
+val guardedReleaseTasks = setOf(
+    "assembleRelease",              // lifecycle: APK
+    "bundleRelease",                // lifecycle: AAB
+    "packageRelease",               // produces the release APK
+    "packageReleaseBundle",         // produces the release AAB
+    "signReleaseBundle",            // signs the AAB
+    "packageReleaseUniversalApk",   // universal APK from the bundle
+    "makeApkFromBundleForRelease",  // APKs extracted from the bundle
+)
+
+tasks.matching { it.name in guardedReleaseTasks }.configureEach {
+    dependsOn(validateVersion, requireReleaseSigning)
+}
+
+/**
+ * Fails if AGP creates a release-artifact task that [guardedReleaseTasks] does not cover.
+ *
+ * The pattern is deliberately broad and then filtered by an explicit allow-list of tasks known
+ * not to emit a distributable artifact, so a genuinely new packaging task shows up as a failure
+ * rather than as silence.
+ */
+tasks.register("verifyReleaseGuards") {
+    group = "verification"
+    description = "Checks that every release-artifact task carries the signing guard."
+    val guarded = guardedReleaseTasks
+    val candidates = provider {
+        tasks.names.filter { name ->
+            name.contains("Release") &&
+                (
+                    name.startsWith("package") ||
+                        name.startsWith("sign") ||
+                        name.startsWith("makeApkFromBundle") ||
+                        name.startsWith("assemble") ||
+                        name.startsWith("bundle")
+                    )
+        }
+    }
+    // Tasks that carry "Release" and a packaging-ish prefix but produce intermediates, not
+    // distributable artifacts. Listed explicitly so the check stays meaningful.
+    val knownNonArtifact = setOf(
+        "packageReleaseResources",
+        "bundleReleaseResources",
+        "bundleReleaseClassesToCompileJar",
+        "bundleReleaseClassesToRuntimeJar",
+        "signingConfigWriterRelease",
+    )
+    doLast {
+        val unguarded = candidates.get()
+            .filterNot { it in guarded || it in knownNonArtifact }
+            .sorted()
+        if (unguarded.isNotEmpty()) {
+            throw GradleException(
+                "These release tasks are not covered by the signing guard: " +
+                    "${unguarded.joinToString(", ")}. Add them to guardedReleaseTasks (or to " +
+                    "knownNonArtifact if they cannot emit a distributable artifact).",
+            )
+        }
+        logger.lifecycle("All ${guarded.size} release-artifact tasks carry the signing guard.")
+    }
+}
+
+/** Exposes the prerelease decision to the release workflow without it re-parsing the version. */
+tasks.register("printReleaseMetadata") {
+    group = "help"
+    description = "Prints version metadata for the release pipeline."
+    val name = appVersionName
+    val code = appVersionCode
+    val pre = isPrerelease
+    doLast {
+        println("APP_VERSION_NAME=$name")
+        println("APP_VERSION_CODE=$code")
+        println("RELEASE_TAG=v$name")
+        println("IS_PRERELEASE=$pre")
     }
 }

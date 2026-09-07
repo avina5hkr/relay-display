@@ -1,0 +1,611 @@
+name: Release
+
+# Signed release builds.
+#
+# Publication is tag-only. There is deliberately no input, and no code path, by which a manual run
+# can publish: `workflow_dispatch` carries no publish boolean at all, and the publish job's own
+# condition re-checks the event and ref type rather than trusting an output from an earlier shell
+# step. A manual run is a signed dry-run, permitted only from `main`.
+#
+# Ordering matters as much as the checks. Everything verifiable without the signing key runs in
+# the `validate` job, which never touches the `release` environment. Only after it passes does any
+# job gain access to signing material.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    # No inputs. A manual run is always a dry run; a boolean here would be a user-controlled path
+    # to publication, which is exactly what must not exist.
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialise per ref. cancel-in-progress is false on purpose: interrupting a half-finished
+  # publish is worse than waiting for it.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------------------------
+  # Gate 1 - no access to the release environment, therefore no access to signing secrets.
+  # -------------------------------------------------------------------------------------------
+  validate:
+    name: Validate ref, tag, version and ancestry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version_name: ${{ steps.meta.outputs.version_name }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      tag: ${{ steps.meta.outputs.tag }}
+      source_sha: ${{ steps.ancestry.outputs.source_sha }}
+
+    steps:
+      - name: Reject a manual run from anywhere but main
+        # A manual run executes branch build logic with signing credentials available, so the ref
+        # is constrained before the build job can reach the environment.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "branch" ] || [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Manual runs are permitted only from refs/heads/main (got $REF_TYPE $REF)."
+            exit 1
+          fi
+          echo "Manual dry-run from main accepted."
+
+      - name: Check out
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK
+        # actions/setup-java v6.0.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          # Matches gradle/gradle-daemon-jvm.properties (toolchainVersion=25).
+          java-version: '25'
+
+      - name: Set up Gradle
+        # gradle/actions v6.3.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          validate-wrappers: true
+          cache-read-only: true
+
+      - name: Read version metadata from source
+        id: meta
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --quiet printReleaseMetadata > meta.txt
+          VERSION_NAME="$(grep '^APP_VERSION_NAME=' meta.txt | cut -d= -f2-)"
+          VERSION_CODE="$(grep '^APP_VERSION_CODE=' meta.txt | cut -d= -f2-)"
+          IS_PRERELEASE="$(grep '^IS_PRERELEASE=' meta.txt | cut -d= -f2-)"
+          {
+            echo "version_name=${VERSION_NAME}"
+            echo "version_code=${VERSION_CODE}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "tag=v${VERSION_NAME}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source declares ${VERSION_NAME} (code ${VERSION_CODE}); expected tag v${VERSION_NAME}"
+
+      - name: Verify release guards cover every release task
+        run: ./gradlew --no-daemon verifyReleaseGuards
+
+      - name: Bind tag, commit and source version
+        id: ancestry
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EXPECTED_TAG: ${{ steps.meta.outputs.tag }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+
+          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            if ! printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'; then
+              echo "::error::Tag '$REF_NAME' is not a valid version tag."
+              exit 1
+            fi
+            if [ "$REF_NAME" != "$EXPECTED_TAG" ]; then
+              echo "::error::Tag '$REF_NAME' does not match the source version. Expected '$EXPECTED_TAG'."
+              exit 1
+            fi
+            # ^{commit} peels both lightweight and annotated tags. A tag resolving to anything
+            # other than exactly one commit is ambiguous and must not be released.
+            MATCHES="$(git rev-parse --verify --quiet "refs/tags/${REF_NAME}^{commit}" | wc -l | tr -d ' ')"
+            if [ "$MATCHES" != "1" ]; then
+              echo "::error::Tag '$REF_NAME' does not resolve to exactly one commit."
+              exit 1
+            fi
+            TAG_SHA="$(git rev-parse --verify "refs/tags/${REF_NAME}^{commit}")"
+            HEAD_SHA="$(git rev-parse HEAD)"
+            if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Checked-out HEAD ($HEAD_SHA) is not the tag's commit ($TAG_SHA)."
+              exit 1
+            fi
+            SOURCE_SHA="$TAG_SHA"
+          else
+            # Manual dry-run; the ref was constrained to refs/heads/main above.
+            SOURCE_SHA="$(git rev-parse HEAD)"
+          fi
+
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
+            echo "::error::Commit $SOURCE_SHA is not contained in origin/main. Releases are cut from main only."
+            exit 1
+          fi
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Validated source commit $SOURCE_SHA"
+
+      - name: A release must not already exist for this tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::A GitHub Release already exists for $TAG. Releases and assets are never overwritten."
+            exit 1
+          fi
+          echo "No existing release for $TAG."
+
+  # -------------------------------------------------------------------------------------------
+  # Gate 2 - build, sign, verify. First job to touch the release environment.
+  # -------------------------------------------------------------------------------------------
+  build:
+    name: Build, sign and verify
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the validated commit
+        # The exact SHA, never a moving branch: a branch could advance between validation and
+        # build, and the artifact would then not correspond to what was validated.
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-verify the checked-out commit
+        env:
+          EXPECTED: ${{ needs.validate.outputs.source_sha }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::HEAD is $ACTUAL but the validated commit is $EXPECTED."
+            exit 1
+          fi
+          echo "Building $ACTUAL"
+
+      - name: Set up JDK
+        # actions/setup-java v6.0.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        # gradle/actions v6.3.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          validate-wrappers: true
+          # Read-only: this job must never write a cache entry, because it configures a signing
+          # config while credentials are in the environment.
+          cache-read-only: true
+          # A build scan would publish build data to an external service. Never for a signed build.
+          build-scan-publish: false
+
+      - name: Required secrets and variables must be present
+        # Before anything is decoded, and reported by NAME only.
+        env:
+          KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "${KEY_B64:-}" ]     || MISSING="$MISSING ANDROID_SIGNING_KEY_BASE64"
+          [ -n "${STORE_PASS:-}" ]  || MISSING="$MISSING ANDROID_KEYSTORE_PASSWORD"
+          [ -n "${KEY_ALIAS:-}" ]   || MISSING="$MISSING ANDROID_KEY_ALIAS"
+          [ -n "${KEY_PASS:-}" ]    || MISSING="$MISSING ANDROID_KEY_PASSWORD"
+          [ -n "${CERT_SHA256:-}" ] || MISSING="$MISSING ANDROID_SIGNING_CERT_SHA256"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required release configuration:$MISSING (set on the 'release' environment)"
+            exit 1
+          fi
+          echo "All required release configuration is present."
+
+      - name: Decode the signing key
+        id: keystore
+        env:
+          KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/release-signing.jks"
+          # umask before creating, so the file is never briefly group- or world-readable.
+          ( umask 077; printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE" )
+          chmod 600 "$KEYSTORE"
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "::error::Decoded keystore is empty. Check that the secret is single-line Base64."
+            exit 1
+          fi
+          echo "::add-mask::$KEYSTORE"
+          echo "path=$KEYSTORE" >> "$GITHUB_OUTPUT"
+
+      - name: Release gates and signed build
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # --no-configuration-cache: the signing config is built at configuration time from the
+          # environment, so a configuration-cache entry would hold the store and key passwords on
+          # disk. Gradle has no encrypted configuration cache, and the cache is read-only here
+          # anyway, so such an entry would be pure risk for no benefit.
+          # Passwords are in the environment, never on the command line.
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            validateVersion \
+            verifyReleaseGuards \
+            testDebugUnitTest \
+            lintRelease \
+            assembleDebugAndroidTest \
+            assembleRelease \
+            bundleRelease
+
+      - name: Verify the APK
+        env:
+          EXPECTED_FINGERPRINT: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          APK=app/build/outputs/apk/release/app-release.apk
+          [ -s "$APK" ] || { echo "::error::Missing or empty APK."; exit 1; }
+
+          # Gradle exiting 0 is not evidence the APK is correctly signed. Verify independently.
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK" > apksigner.txt
+
+          grep -q '^Verifies$' apksigner.txt \
+            || { echo "::error::apksigner did not report overall verification."; exit 1; }
+          # v1 is required, not optional: minSdk is 23, and API below 24 verifies only the v1 JAR
+          # signature. An APK without v1 installs on modern Android and fails on the Lenovo.
+          grep -q "Verified using v1 scheme (JAR signing): true" apksigner.txt \
+            || { echo "::error::APK is not v1-signed; required for minSdk 23."; exit 1; }
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" apksigner.txt \
+            || { echo "::error::APK is not v2-signed."; exit 1; }
+          # v3 is welcome but not required. v4 is deliberately not required.
+
+          SIGNER_COUNT="$(grep -c 'certificate SHA-256 digest:' apksigner.txt || true)"
+          if [ "$SIGNER_COUNT" != "1" ]; then
+            echo "::error::Expected exactly one APK signer, found $SIGNER_COUNT."
+            exit 1
+          fi
+          ACTUAL_FP="$(grep -m1 'certificate SHA-256 digest:' apksigner.txt | awk '{print $NF}' \
+            | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_FP="$(printf '%s' "$EXPECTED_FINGERPRINT" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          [ -n "$ACTUAL_FP" ] || { echo "::error::Could not read the APK signer fingerprint."; exit 1; }
+          if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then
+            # Fingerprints are public certificate data, so printing them is safe and is the only
+            # way to make a mismatch diagnosable.
+            echo "::error::APK certificate mismatch. Expected $EXPECTED_FP, got $ACTUAL_FP."
+            exit 1
+          fi
+
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK")"
+          echo "$BADGING" | grep -q "package: name='com.avinash.relaydisplay'" \
+            || { echo "::error::Unexpected applicationId."; exit 1; }
+          echo "$BADGING" | grep -q "versionCode='${EXPECTED_VERSION_CODE}'" \
+            || { echo "::error::APK versionCode does not match source."; exit 1; }
+          echo "$BADGING" | grep -q "versionName='${EXPECTED_VERSION_NAME}'" \
+            || { echo "::error::APK versionName does not match source."; exit 1; }
+
+          echo "APK verified: v1+v2 signed, single signer, fingerprint and version match."
+
+      - name: Verify the AAB
+        env:
+          EXPECTED_FINGERPRINT: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          [ -s "$AAB" ] || { echo "::error::Missing or empty AAB."; exit 1; }
+
+          # jarsigner -verify alone proves only that *some* valid signature exists. It says
+          # nothing about whose certificate it is, so the fingerprint is compared separately.
+          jarsigner -verify "$AAB" | grep -q "jar verified" \
+            || { echo "::error::AAB signature did not verify."; exit 1; }
+
+          # keytool -printcert -jarfile is the standard JDK way to read a JAR/AAB signer cert.
+          keytool -printcert -jarfile "$AAB" > aabcert.txt 2>&1 \
+            || { echo "::error::Could not read the AAB signer certificate."; exit 1; }
+
+          SIGNER_COUNT="$(grep -c 'Signer #' aabcert.txt || true)"
+          if [ "$SIGNER_COUNT" = "0" ]; then
+            echo "::error::AAB has no signer."
+            exit 1
+          fi
+          if [ "$SIGNER_COUNT" != "1" ]; then
+            echo "::error::Expected exactly one AAB signer, found $SIGNER_COUNT."
+            exit 1
+          fi
+
+          FP_COUNT="$(grep -c 'SHA256:' aabcert.txt || true)"
+          [ "$FP_COUNT" != "0" ] || { echo "::error::No SHA-256 fingerprint in keytool output."; exit 1; }
+          AAB_FP="$(grep -m1 'SHA256:' aabcert.txt | sed 's/.*SHA256://' \
+            | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_FP="$(printf '%s' "$EXPECTED_FINGERPRINT" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          [ -n "$AAB_FP" ] || { echo "::error::Could not parse the AAB fingerprint."; exit 1; }
+          if [ "$AAB_FP" != "$EXPECTED_FP" ]; then
+            echo "::error::AAB certificate mismatch. Expected $EXPECTED_FP, got $AAB_FP."
+            exit 1
+          fi
+
+          echo "AAB verified: jar signature valid, single signer, fingerprint matches."
+
+      - name: Stage artifacts, build info and checksums
+        env:
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
+          CERT_FP: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          OUT=dist
+          mkdir -p "$OUT"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT/RelayDisplay-${VERSION_NAME}.apk"
+          cp app/build/outputs/bundle/release/app-release.aab "$OUT/RelayDisplay-${VERSION_NAME}.aab"
+          cp app/build/outputs/mapping/release/mapping.txt "$OUT/RelayDisplay-${VERSION_NAME}-mapping.txt"
+
+          # Build info ties these bytes to a commit and a certificate. Everything here is public:
+          # no passwords, no keystore data, no keystore or runner paths, no environment dump.
+          NORMALISED_FP="$(printf '%s' "$CERT_FP" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "application-id: com.avinash.relaydisplay"
+            echo "version-name: ${VERSION_NAME}"
+            echo "version-code: ${VERSION_CODE}"
+            echo "expected-tag: ${EXPECTED_TAG}"
+            echo "source-commit: ${SOURCE_SHA}"
+            echo "github-run-id: ${GITHUB_RUN_ID}"
+            echo "build-time-utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "signing-cert-sha256: ${NORMALISED_FP}"
+            echo ""
+            echo "Reproducibility is not claimed: Android signing embeds timestamps and this"
+            echo "project has not demonstrated byte-for-byte reproducible builds."
+          } > "$OUT/RelayDisplay-${VERSION_NAME}-build-info.txt"
+
+          # sha256sum's default output is accepted by both sha256sum -c and shasum -a 256 -c.
+          ( cd "$OUT" && sha256sum RelayDisplay-* > SHA256SUMS )
+          cat "$OUT/SHA256SUMS"
+
+      - name: Remove the decoded key
+        # always(): the key must not survive a failed build either.
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/release-signing.jks" || true
+          echo "Decoded keystore removed."
+
+      - name: Upload artifacts
+        # dist/ only. The keystore lives in RUNNER_TEMP, outside the workspace, so no path glob
+        # here can collect it.
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-artifacts
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Dry-run summary
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        run: |
+          {
+            echo "### Dry run complete"
+            echo ""
+            echo "Artifacts were built, signed and verified. No tag, release or asset was created."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------------------------
+  # Gate 3 - publish. The only job with contents: write.
+  # -------------------------------------------------------------------------------------------
+  publish:
+    name: Create the GitHub Release
+    needs: [validate, build]
+    # Tag pushes only. Evaluated from the event itself rather than from an output of an earlier
+    # shell step, so a buggy or tampered script in `validate` cannot talk this job into running.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the validated commit
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-verify the checked-out commit
+        env:
+          EXPECTED: ${{ needs.validate.outputs.source_sha }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git rev-parse HEAD)"
+          [ "$ACTUAL" = "$EXPECTED" ] \
+            || { echo "::error::HEAD is $ACTUAL but the validated commit is $EXPECTED."; exit 1; }
+
+      - name: Download artifacts
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Re-verify everything immediately before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+
+          # 1. checksums over the downloaded bytes
+          ( cd dist && sha256sum -c SHA256SUMS )
+
+          # 2. build-info names the validated commit. This is what ties the uploaded bytes to the
+          #    tag; gh --verify-tag only proves the tag exists.
+          INFO="$(find dist -maxdepth 1 -name '*-build-info.txt' | head -1)"
+          grep -q "^source-commit: ${SOURCE_SHA}$" "$INFO" \
+            || { echo "::error::build-info does not name the validated commit."; exit 1; }
+
+          # 3. the pushed tag is still the expected one
+          [ "$REF_NAME" = "$TAG" ] \
+            || { echo "::error::Pushed tag '$REF_NAME' is not '$TAG'."; exit 1; }
+
+          # 4. the tag still resolves to the validated commit; it may have been moved or deleted
+          #    while the build ran
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          TAG_SHA="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          [ "$TAG_SHA" = "$SOURCE_SHA" ] \
+            || { echo "::error::Tag $TAG now points at $TAG_SHA, not $SOURCE_SHA."; exit 1; }
+
+          # 5. that commit is still on main
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main \
+            || { echo "::error::$SOURCE_SHA is no longer contained in origin/main."; exit 1; }
+
+          # 6. still no release for this tag
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::A release for $TAG appeared while building. Not overwriting it."
+            exit 1
+          fi
+
+          echo "Re-verified: tag, commit, ancestry, checksums, build-info, and absence of a release."
+
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          # The GitHub CLI manual does not document --notes-file and --generate-notes as
+          # combinable, so that combination is not used. Instead the documented REST endpoint
+          # POST /repos/{owner}/{repo}/releases/generate-notes produces the commit-derived notes,
+          # appended to the hand-written section below. One --notes-file, no reliance on
+          # undocumented flag interaction.
+          {
+            echo "## Relay Display ${VERSION_NAME}"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "Download **RelayDisplay-${VERSION_NAME}.apk** and install it on both phones."
+            echo ""
+            echo "The \`.aab\` is a Play Console upload format and **cannot be installed**."
+            echo ""
+            echo "### Verify your download first"
+            echo ""
+            echo "Linux:"
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo ""
+            echo "macOS:"
+            echo ""
+            echo '```bash'
+            echo "shasum -a 256 -c SHA256SUMS"
+            echo '```'
+            echo ""
+            echo "Built from commit \`${SOURCE_SHA}\`. The build-info file records the signing"
+            echo "certificate fingerprint."
+            echo ""
+          } > notes.md
+
+          if gh api --method POST "repos/${GH_REPO}/releases/generate-notes" \
+               -f tag_name="$TAG" \
+               -f target_commitish="$SOURCE_SHA" \
+               --jq '.body' > generated.md 2>/dev/null && [ -s generated.md ]; then
+            cat generated.md >> notes.md
+          else
+            echo "_Automatic release notes were unavailable for this build._" >> notes.md
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          # --verify-tag refuses to create an implicit tag: the tag must already exist, which it
+          # does, because a tag push is what triggered this run.
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            # --latest=false so a beta never becomes the "latest release" download.
+            gh release create "$TAG" \
+              --title "Relay Display ${VERSION_NAME}" \
+              --notes-file notes.md \
+              --verify-tag \
+              --prerelease \
+              --latest=false \
+              "dist/RelayDisplay-${VERSION_NAME}.apk" \
+              "dist/RelayDisplay-${VERSION_NAME}.aab" \
+              "dist/RelayDisplay-${VERSION_NAME}-mapping.txt" \
+              "dist/RelayDisplay-${VERSION_NAME}-build-info.txt" \
+              dist/SHA256SUMS
+          else
+            gh release create "$TAG" \
+              --title "Relay Display ${VERSION_NAME}" \
+              --notes-file notes.md \
+              --verify-tag \
+              --latest \
+              "dist/RelayDisplay-${VERSION_NAME}.apk" \
+              "dist/RelayDisplay-${VERSION_NAME}.aab" \
+              "dist/RelayDisplay-${VERSION_NAME}-mapping.txt" \
+              "dist/RelayDisplay-${VERSION_NAME}-build-info.txt" \
+              dist/SHA256SUMS
+          fi
