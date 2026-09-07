@@ -118,7 +118,17 @@ Both phones must be able to reach each other on a local network. Mobile data alo
 | `RelayDisplay-<version>.apk` | **This is the one you install.** Put it on both phones. |
 | `RelayDisplay-<version>.aab` | Play Console upload format — **not installable**. Ignore it. |
 | `RelayDisplay-<version>-mapping.txt` | R8 mapping, for deobfuscating a crash report. |
-| `SHA256SUMS` | Checksums. Verify before installing: `sha256sum -c SHA256SUMS`. |
+| `RelayDisplay-<version>-build-info.txt` | Which commit and signing certificate produced the build. |
+| `SHA256SUMS` | Checksums — verify before installing (below). |
+
+Verify your download first. Put `SHA256SUMS` next to the downloaded files, then:
+
+```bash
+shasum -a 256 -c SHA256SUMS   # macOS
+sha256sum -c SHA256SUMS       # Linux
+```
+
+Every line must report `OK`.
 
 Both phones need the **same** APK. Android will refuse an update signed by a different key, so
 install from the same source each time.

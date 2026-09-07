@@ -89,12 +89,27 @@ Do this once.
 
    Colons and case do not matter; the workflow normalises it.
 
-4. Under the environment's **Deployment protection rules**, add yourself as a **required
-   reviewer** if your plan supports it. Then no signed build starts without you approving it,
-   even if someone pushes a tag.
+4. Under **Deployment protection rules**, configure all of the following:
+   - **Required reviewers:** add yourself. No signed build then starts without your approval,
+     even if someone pushes a tag.
+   - **Deployment branches and tags → Selected branches and tags**, and add exactly two rules:
+     - branch `main`
+     - tag `v*`
 
-Putting the secrets on the environment rather than the repository is what stops the CI workflow —
-or any future workflow — from reading them. Only jobs that declare `environment: release` can.
+     Every other branch and tag is then denied. This is the rule that stops a signed build from
+     running off an arbitrary branch.
+
+> **How environment secrets are actually protected.** Environment secrets are **not** bound to a
+> particular workflow. *Any* job in *any* workflow in this repository can write
+> `environment: release` and request them. What protects them is the environment's own
+> configuration: the allowed branch/tag list, and required reviewer approval. Those rules are the
+> security boundary — not the choice of which workflow reads them.
+>
+> The workflows here add defence in depth on top of that: `ci.yml` never names the environment,
+> and `release.yml` refuses a manual run from any ref other than `refs/heads/main` before the
+> build job is reached. But if you skip the deployment-branch restriction, a new workflow on a
+> feature branch could request the environment, and only the reviewer prompt would stand in
+> its way.
 
 ### Repository hardening
 
@@ -143,10 +158,20 @@ bumping a version is a reviewable change, not something a robot does behind you.
 10. Watch the **Release** workflow. Approve the `release` environment if you configured a
     reviewer.
 11. Download the published APK from the release page.
-12. Verify it before installing:
+12. Verify it before installing. Download `SHA256SUMS` alongside the APK, then:
+
+    macOS (what you are on):
+    ```bash
+    shasum -a 256 -c SHA256SUMS
+    ```
+
+    Linux:
     ```bash
     sha256sum -c SHA256SUMS
     ```
+
+    Both read the same file; `SHA256SUMS` is generated in `sha256sum`'s default format, which
+    `shasum -a 256 -c` also accepts. Every line must say `OK`.
 13. Install on both phones and check the app opens and pairs.
 
 > Never build a release from a feature branch. The workflow enforces this — a tag whose commit is
@@ -154,8 +179,40 @@ bumping a version is a reviewable change, not something a robot does behind you.
 
 ### If the tag was wrong
 
-Delete it locally and remotely, fix the version, and tag again. The workflow refuses to overwrite
-an existing GitHub Release, so a botched publish needs the release deleted in the UI first.
+What is safe depends entirely on whether anything was published.
+
+**Nothing was published** — the workflow failed before the publish job, no release exists and no
+asset was ever downloadable. Deleting and recreating the tag is acceptable:
+
+```bash
+git tag -d v0.1.0-beta.1
+git push origin :refs/tags/v0.1.0-beta.1
+# fix gradle.properties, merge, then tag again
+```
+
+Confirm on the Releases page that nothing exists for that tag before doing this.
+
+**A release was published, or anyone may have downloaded an asset** — then the version is spent.
+Do not reuse it:
+
+- **Never** replace the assets of a published release. Someone may already hold the old bytes, and
+  the checksums you published would no longer match what the page serves.
+- **Never** reuse the tag.
+- **Never** reuse the `APP_VERSION_NAME`.
+- Increment `APP_VERSION_CODE`, choose a new `APP_VERSION_NAME` (for example `0.1.0-beta.2`), and
+  publish a corrective release.
+- If the bad release is misleading, mark it as a prerelease or add a note pointing at the
+  replacement. Deleting it does not un-download it.
+
+A published version number is a permanent fact. Play enforces this absolutely — a `versionCode`
+it has seen can never be used again — and GitHub users who verified a checksum deserve the same
+guarantee.
+
+If your account has **immutable releases** available, enable it. It makes asset replacement
+impossible rather than merely discouraged, which is the guarantee you actually want.
+
+The pipeline enforces its half of this: it refuses to build if a release already exists for the
+tag, re-checks immediately before publishing, and never overwrites an existing release or asset.
 
 ---
 
@@ -241,6 +298,13 @@ It does check:
 - the AAB verifies with `jarsigner`
 - unit tests and `lintRelease` pass, and instrumentation tests **compile**
 
+It also produces `RelayDisplay-<version>-build-info.txt`, which records the application ID,
+version name and code, expected tag, **validated source commit**, run ID, UTC build time and the
+public signing-certificate fingerprint. It contains no passwords, no keystore data and no paths.
+Before publishing, the pipeline re-reads it and refuses to continue unless it names the same
+commit the tag resolves to — which is what ties the uploaded bytes to the tag.
+`gh release create --verify-tag` alone cannot do that: it proves only that the tag exists.
+
 It does **not** check:
 
 - that instrumentation tests **pass** — they need a device; nothing in CI runs them
@@ -248,3 +312,31 @@ It does **not** check:
 - byte-for-byte reproducibility — this is **not** claimed. Android signing embeds timestamps, and
   reproducibility has not been demonstrated for this project
 - that the APK installs as an upgrade over the previous release — that is the manual check above
+
+### Supply chain: dependency verification is not configured
+
+**Gradle dependency verification is deliberately deferred, and this is a real risk worth
+naming.** `gradle/verification-metadata.xml` does not exist, so Gradle trusts whatever the
+configured repositories serve.
+
+Why it matters here specifically: the release job executes Gradle build logic — plugins, the
+Kotlin compiler, AGP, and the license-notice task's POM resolution — *while the signing key is
+decoded and its passwords are in the environment*. A compromised or substituted build-time
+artifact would run with access to the app's permanent signing identity, which is the one secret
+that cannot be rotated without breaking updates for every installed user.
+
+Partial mitigations already in place:
+
+- the Gradle wrapper is pinned by `distributionSha256Sum` and validated by
+  `gradle/actions/setup-gradle` before it executes;
+- every GitHub Action is pinned to a full commit SHA;
+- dependency versions are pinned in `gradle/libs.versions.toml`, so a version is not resolved
+  dynamically at build time;
+- the Gradle cache is read-only in the release job, so a poisoned entry cannot be written by it.
+
+None of those verify artifact *checksums or signatures*. Adding real verification means
+generating metadata covering plugins, runtime dependencies and the POMs the license task
+resolves, using strict mode, and proving a clean build still works — and Dependabot updates would
+then also have to regenerate and review that metadata. That is a substantial change with its own
+failure modes, and doing it badly breaks every clean build. It is tracked as follow-up work
+rather than half-implemented here.
