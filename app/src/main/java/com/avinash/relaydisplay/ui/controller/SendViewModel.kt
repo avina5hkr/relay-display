@@ -67,7 +67,7 @@ data class SendUiState(
         get() = (connection as? ConnectionState.Connected)
             ?.peer
             ?.capabilities
-            ?.contains(Capabilities.FILE_V1) == true
+            ?.contains(Capabilities.FILE_V2) == true
 
     val canSendPicked: Boolean get() = connected && picked.isNotEmpty() && fileBatch == null
 

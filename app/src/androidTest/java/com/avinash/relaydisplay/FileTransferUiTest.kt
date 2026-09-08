@@ -23,6 +23,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.unit.dp
+import com.avinash.relaydisplay.content.SaveState
 
 /**
  * The file-transfer surfaces, on a real device.
@@ -217,6 +223,215 @@ class FileTransferUiTest {
         // needed, so the list is still what is on screen.
         compose.onNodeWithTag("received_open").assertIsDisplayed()
         assertTrue(compose.onAllNodesWithTag("open_warning_dialog").fetchSemanticsNodes().isEmpty())
+    }
+
+    // -- the dialog at its maximum size -------------------------------------------------------
+
+    private fun twentyFiles() = IncomingBatch(
+        UUID.randomUUID(),
+        "Avi's controller",
+        List(20) { IncomingFile("document-number-${it + 1}.pdf", "application/pdf", 250_000L * (it + 1)) },
+    )
+
+    @Test
+    fun aTwentyFileDialogKeepsAcceptAndRejectReachable() {
+        // 20 is the protocol's own maximum. An unbounded Column here pushed the buttons off the
+        // bottom of the dialog, so the offer became unanswerable at exactly the size the protocol
+        // permits, and the sender waited for a decision that could not be given.
+        compose.setContent {
+            RelayDisplayTheme { IncomingBatchDialog(twentyFiles(), onAccept = {}, onReject = {}) }
+        }
+
+        compose.onNodeWithTag("batch_accept").assertIsDisplayed().assertHasClickAction()
+        compose.onNodeWithTag("batch_reject").assertIsDisplayed().assertHasClickAction()
+        // The summary is outside the scroll area: it is what the decision is made on, so it must
+        // never be the part that scrolls away. The count appears in both the title and the body,
+        // so this asserts on the title exactly rather than on a substring that matches twice.
+        compose.onNodeWithText("Receive 20 file(s)?").assertIsDisplayed()
+    }
+
+    @Test
+    fun aTwentyFileDialogStillReportsTheTotalAndSender() {
+        compose.setContent {
+            RelayDisplayTheme { IncomingBatchDialog(twentyFiles(), onAccept = {}, onReject = {}) }
+        }
+        compose.onNodeWithText("Avi's controller", substring = true).assertIsDisplayed()
+        // 250 KB * (1..20) = 52.5 MB.
+        compose.onNodeWithText("MB in total", substring = true).assertIsDisplayed()
+    }
+
+    @Test
+    fun aTwentyFileDialogScrollsToItsLastFile() {
+        compose.setContent {
+            RelayDisplayTheme { IncomingBatchDialog(twentyFiles(), onAccept = {}, onReject = {}) }
+        }
+        // Every name is reachable, which is the other half of "usable at maximum size": the user
+        // has to be able to see what they are accepting. performScrollTo rather than
+        // performScrollToIndex because the list is a bounded scrollable Column, not a lazy list:
+        // AlertDialog measures its content with unbounded height, and nesting a lazy layout in
+        // that crashes.
+        compose.onNodeWithText("document-number-20.pdf", substring = true).performScrollTo()
+        compose.onNodeWithText("document-number-20.pdf", substring = true).assertIsDisplayed()
+        // Still reachable afterwards, which is the point of keeping them outside the scroll area.
+        compose.onNodeWithTag("batch_accept").assertIsDisplayed()
+    }
+
+    @Test
+    fun aTwentyFileDialogStillShowsTheExecutableWarning() {
+        val withApk = IncomingBatch(
+            UUID.randomUUID(),
+            "Avi's controller",
+            List(19) { IncomingFile("doc-$it.pdf", "application/pdf", 1_000L) } +
+                IncomingFile("app.apk", "application/vnd.android.package-archive", 900_000L),
+        )
+        compose.setContent {
+            RelayDisplayTheme { IncomingBatchDialog(withApk, onAccept = {}, onReject = {}) }
+        }
+        // The warning sits outside the scroll region for the same reason as the summary.
+        compose.onNodeWithTag("batch_executable_warning").assertIsDisplayed()
+    }
+
+    @Test
+    fun eachDialogRowDescribesItsFileForAccessibility() {
+        compose.setContent {
+            RelayDisplayTheme {
+                IncomingBatchDialog(
+                    batch(IncomingFile("quarterly.pdf", "application/pdf", 2_400_000)),
+                    onAccept = {},
+                    onReject = {},
+                )
+            }
+        }
+        // The visible row is decorated with a bullet; the semantics are the plain name and size.
+        compose.onNodeWithContentDescription("quarterly.pdf, 2.3 MB").assertExists()
+    }
+
+    // -- received-file actions ------------------------------------------------------------------
+
+    @Test
+    fun allFourActionsFitWithoutOverflowing() {
+        // A single Row of four text buttons fitted the S22 and clipped elsewhere. The grid wraps
+        // by construction, so all four are displayed rather than merely present.
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(listOf(received("report.pdf", "application/pdf")), onDelete = {})
+            }
+        }
+        for (tag in listOf("received_open", "received_save", "received_share", "received_delete")) {
+            compose.onNodeWithTag(tag).assertIsDisplayed().assertHasClickAction()
+        }
+    }
+
+    @Test
+    fun actionTargetsMeetTheMinimumTouchSize() {
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(listOf(received("report.pdf", "application/pdf")), onDelete = {})
+            }
+        }
+        for (tag in listOf("received_open", "received_save", "received_share", "received_delete")) {
+            compose.onNodeWithTag(tag).assertHeightIsAtLeast(48.dp)
+        }
+    }
+
+    @Test
+    fun actionsNameTheFileForAccessibility() {
+        // The visible label stays short; TalkBack gets the action and the filename.
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(listOf(received("report.pdf", "application/pdf")), onDelete = {})
+            }
+        }
+        compose.onNodeWithContentDescription("Open report.pdf").assertExists()
+        compose.onNodeWithContentDescription("Delete report.pdf").assertExists()
+        compose.onNodeWithContentDescription("Share report.pdf").assertExists()
+    }
+
+    // -- save state -----------------------------------------------------------------------------
+
+    @Test
+    fun aSaveInProgressIsVisibleAndBlocksASecondSave() {
+        val file = received("big.zip", "application/zip")
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(
+                    files = listOf(file),
+                    onDelete = {},
+                    saveState = SaveState.Saving(file.transferId, file.displayName),
+                )
+            }
+        }
+        compose.onNodeWithTag("save_in_progress").assertIsDisplayed()
+        compose.onNodeWithTag("save_progress").assertIsDisplayed()
+        // Disabled while a copy is running, so a double tap cannot start a competing one.
+        compose.onNodeWithTag("received_save").assertIsNotEnabled()
+    }
+
+    @Test
+    fun aFailedSaveSaysSoAndCanBeDismissed() {
+        val file = received("big.zip", "application/zip")
+        var dismissed = 0
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(
+                    files = listOf(file),
+                    onDelete = {},
+                    saveState = SaveState.Failed(file.transferId, file.displayName, "That file could not be saved."),
+                    onDismissSaveMessage = { dismissed++ },
+                )
+            }
+        }
+        compose.onNodeWithTag("save_failed").assertIsDisplayed()
+        compose.onNodeWithText("could not be saved", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("OK").performClick()
+        assertEquals(1, dismissed)
+    }
+
+    @Test
+    fun aCompletedSaveSaysSo() {
+        val file = received("big.zip", "application/zip")
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(
+                    files = listOf(file),
+                    onDelete = {},
+                    saveState = SaveState.Completed(file.transferId, file.displayName),
+                )
+            }
+        }
+        compose.onNodeWithTag("save_completed").assertIsDisplayed()
+    }
+
+    @Test
+    fun aSaveOnOneRowDoesNotMarkAnotherRowAsSaving() {
+        val a = received("a.pdf", "application/pdf")
+        val b = received("b.pdf", "application/pdf")
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(
+                    files = listOf(a, b),
+                    onDelete = {},
+                    saveState = SaveState.Saving(a.transferId, a.displayName),
+                )
+            }
+        }
+        // One row shows progress, not both.
+        assertEquals(1, compose.onAllNodesWithTag("save_in_progress").fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun theListIsUnaffectedWhenNothingIsSaving() {
+        compose.setContent {
+            RelayDisplayTheme {
+                ReceivedFilesSection(
+                    files = listOf(received("a.pdf", "application/pdf")),
+                    onDelete = {},
+                    saveState = SaveState.Idle,
+                )
+            }
+        }
+        assertTrue(compose.onAllNodesWithTag("save_in_progress").fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithTag("received_save").assertIsDisplayed()
     }
 
     @Test

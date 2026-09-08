@@ -62,16 +62,41 @@ class MessageCodecTest {
         FileBatchOffer(
             id = id,
             batchId = transferId,
-            senderName = "Avi's phone",
             files = listOf(
-                FileManifestEntry("report.pdf", "application/pdf", 1_234L),
+                FileManifestEntry(
+                    transferId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                    displayName = "report.pdf",
+                    mimeType = "application/pdf",
+                    sizeBytes = 1_234L,
+                    sha256 = ByteArray(32) { it.toByte() },
+                ),
                 // A non-ASCII name and an empty MIME type in the same sample: both are ordinary,
                 // and both are where a hand-rolled manifest encoding goes wrong.
-                FileManifestEntry("\u6f22\u5b57 notes.txt", "", 0L),
+                FileManifestEntry(
+                    transferId = UUID.fromString("11111111-1111-1111-1111-111111111111"),
+                    displayName = "\u6f22\u5b57 notes.txt",
+                    mimeType = "",
+                    sizeBytes = 0L,
+                    sha256 = ByteArray(32) { (it * 3).toByte() },
+                ),
             ),
         ),
         FileBatchAccept(id, transferId),
         FileBatchReject(id, transferId, ProtocolErrorCode.PERMISSION_DENIED),
+        FileBatchCancel(id, transferId, ProtocolErrorCode.CANCELLED),
+        // A generic file offer carries the batch binding; the image sample above carries none, so
+        // both encodings are covered.
+        ContentOffer(
+            id = id,
+            transferId = transferId,
+            kind = ContentKind.FILE,
+            sizeBytes = 4096,
+            mimeType = "application/zip",
+            displayName = "bundle.zip",
+            sha256 = ByteArray(32) { (it + 7).toByte() },
+            batchId = UUID.fromString("22222222-2222-2222-2222-222222222222"),
+            manifestIndex = 3,
+        ),
     )
 
     @Test

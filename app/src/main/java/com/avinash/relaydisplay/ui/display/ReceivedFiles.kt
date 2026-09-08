@@ -38,6 +38,17 @@ import com.avinash.relaydisplay.ui.common.RelayDimens
 import java.io.IOException
 import java.util.Locale
 import java.util.UUID
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import com.avinash.relaydisplay.content.SaveState
+import androidx.compose.ui.Alignment
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 
 /**
  * Asks whether to accept a batch of files.
@@ -62,23 +73,26 @@ fun IncomingBatchDialog(
         onDismissRequest = onReject,
         title = { Text("Receive ${batch.count} file(s)?") },
         text = {
+            // Bounded height, and the file list scrolls inside it. An unbounded Column here meant
+            // that at the protocol's own maximum of 20 files -- or fewer with a large font scale,
+            // display enlargement, or names wrapping to two lines -- the list pushed Accept and
+            // Reject off the bottom of the dialog, so the offer became unanswerable at exactly
+            // the size the protocol permits.
+            //
+            // The summary and the warning stay outside the scroll area: they are the part the
+            // decision is made on, so they must never be the part that scrolls away.
             Column {
                 Text(
                     "${batch.senderName} wants to send ${batch.count} file(s), " +
                         "${formatSize(batch.totalBytes)} in total.",
                     style = MaterialTheme.typography.bodyLarge,
                 )
-                VerticalGap(RelayDimens.SmallGap)
-                // Every name and size, not a count: "accept 12 files" tells the user nothing
-                // about what they are accepting.
-                batch.files.forEach { file ->
-                    Text(
-                        "· ${file.displayName} (${formatSize(file.sizeBytes)})",
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+
+                // The warning sits *above* the file list, not below it. Both this and the summary
+                // are what the decision is made on, so neither may be displaceable by the list.
+                // With the warning below, a 20-file manifest in landscape at a large font scale
+                // pushed it out of the dialog entirely -- found by running the instrumentation
+                // suite on the Lenovo rotated and at font_scale 1.3, not by inspection.
                 if (batch.containsExecutable) {
                     VerticalGap(RelayDimens.SmallGap)
                     Text(
@@ -87,7 +101,44 @@ fun IncomingBatchDialog(
                             "expecting them.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag("batch_executable_warning"),
                     )
+                }
+
+                VerticalGap(RelayDimens.SmallGap)
+
+                // Bounded, and the bound adapts to the window rather than being a fixed 200dp.
+                // A fixed cap is fine in portrait and too tall in landscape, where the whole
+                // dialog has roughly half the height to work with.
+                //
+                // Not a LazyColumn: this sits inside AlertDialog's own scrollable content, and
+                // nesting a lazy layout in a parent that measures children with unbounded height
+                // crashes. A bounded, scrollable Column is the safe equivalent for at most 20 rows.
+                // The window's own height, not the screen's: a dialog is laid out inside the
+                // window, and on a split-screen or resized window the screen figure is simply
+                // wrong. Lint flags Configuration.screenHeightDp for exactly this reason.
+                val windowHeight = with(LocalDensity.current) {
+                    LocalWindowInfo.current.containerSize.height.toDp()
+                }
+                val listMaxHeight = (windowHeight * 0.28f).coerceAtMost(200.dp)
+                Column(
+                    Modifier
+                        .heightIn(max = listMaxHeight)
+                        .verticalScroll(rememberScrollState())
+                        .testTag("batch_file_list"),
+                ) {
+                    batch.files.forEach { file ->
+                        Text(
+                            "· ${file.displayName} (${formatSize(file.sizeBytes)})",
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.semantics {
+                                contentDescription =
+                                    "${file.displayName}, ${formatSize(file.sizeBytes)}"
+                            },
+                        )
+                    }
                 }
             }
         },
@@ -119,6 +170,10 @@ fun ReceivedFilesSection(
     files: List<ReceivedFile>,
     onDelete: (UUID) -> Unit,
     modifier: Modifier = Modifier,
+    /** Where the copy actually happens: off the main thread, in the view model. */
+    onSave: (ReceivedFile, Uri) -> Unit = { _, _ -> },
+    saveState: SaveState = SaveState.Idle,
+    onDismissSaveMessage: () -> Unit = {},
 ) {
     val context = LocalContext.current
 
@@ -136,9 +191,9 @@ fun ReceivedFilesSection(
     ) { destination ->
         val source = pendingSave
         pendingSave = null
-        if (destination != null && source != null) {
-            error = copyOut(context, source, destination)
-        }
+        // Hands off and returns. This callback used to run the copy itself, which put up to
+        // 50 MiB of IO on the main thread.
+        if (destination != null && source != null) onSave(source, destination)
     }
 
     SectionHeader("Received files")
@@ -176,33 +231,48 @@ fun ReceivedFilesSection(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(
-                        onClick = {
-                            // An executable never opens on one tap, whatever its declared type.
-                            if (file.needsOpenWarning) {
-                                warnBeforeOpen = file
-                            } else {
-                                error = openWith(context, file)
-                            }
-                        },
-                        modifier = Modifier.testTag("received_open"),
-                    ) { Text("Open") }
-                    TextButton(
-                        onClick = {
-                            pendingSave = file
-                            saveAs.launch(file.displayName)
-                        },
-                        modifier = Modifier.testTag("received_save"),
-                    ) { Text("Save as") }
-                    TextButton(
-                        onClick = { error = shareFile(context, file) },
-                        modifier = Modifier.testTag("received_share"),
-                    ) { Text("Share") }
-                    TextButton(
-                        onClick = { confirmDelete = file },
-                        modifier = Modifier.testTag("received_delete"),
-                    ) { Text("Delete") }
+                val savingThis = (saveState as? SaveState.Saving)?.transferId == file.transferId
+                ReceivedFileActions(
+                    savingThis = savingThis,
+                    // Any save in flight disables every row's Save As, so a second tap cannot
+                    // start a competing copy while one is running.
+                    saveBusy = saveState is SaveState.Saving,
+                    fileName = file.displayName,
+                    onOpen = {
+                        // An executable never opens on one tap, whatever its declared type.
+                        if (file.needsOpenWarning) {
+                            warnBeforeOpen = file
+                        } else {
+                            error = openWith(context, file)
+                        }
+                    },
+                    onSaveAs = {
+                        pendingSave = file
+                        saveAs.launch(file.displayName)
+                    },
+                    onShare = { error = shareFile(context, file) },
+                    onDelete = { confirmDelete = file },
+                )
+
+                if (savingThis) {
+                    LinearProgressIndicator(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
+                            .testTag("save_progress"),
+                    )
+                    Text(
+                        "Saving...",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag("save_in_progress"),
+                    )
+                }
+                (saveState as? SaveState.Completed)?.takeIf { it.transferId == file.transferId }?.let {
+                    SaveMessage("Saved.", isError = false, onDismiss = onDismissSaveMessage)
+                }
+                (saveState as? SaveState.Failed)?.takeIf { it.transferId == file.transferId }?.let {
+                    SaveMessage(it.message, isError = true, onDismiss = onDismissSaveMessage)
                 }
             }
         }
@@ -320,20 +390,111 @@ private fun shareFile(context: Context, file: ReceivedFile): String? = guardedIn
 }
 
 /**
- * Copies a received file to wherever the user chose.
+ * The four per-file actions, as a two-by-two grid.
  *
- * Streamed, not read into memory: this runs for files up to the 50 MB transfer limit.
+ * A single Row of four text buttons fitted the S22 and overflowed elsewhere: on the API 24 phone
+ * at 720dp-wide, and on any device once the font scale goes up or the labels are translated, the
+ * fourth label clipped. A grid wraps by construction instead of relying on the labels staying
+ * short, and each cell keeps a full-width touch target rather than shrinking to fit.
+ *
+ * Delete sits in its own row and is coloured as an error, so the destructive action is not one
+ * mis-tap away from Share.
  */
-private fun copyOut(context: Context, file: ReceivedFile, destination: Uri): String? {
-    return try {
-        val stream = context.contentResolver.openOutputStream(destination)
-            ?: return "That location could not be written to."
-        stream.use { out -> file.file.inputStream().use { input -> input.copyTo(out) } }
-        null
-    } catch (e: IOException) {
-        "That file could not be saved."
-    } catch (e: SecurityException) {
-        "That location could not be written to."
+@Composable
+private fun ReceivedFileActions(
+    savingThis: Boolean,
+    saveBusy: Boolean,
+    fileName: String,
+    onOpen: () -> Unit,
+    onSaveAs: () -> Unit,
+    onShare: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ActionCell(
+                label = "Open",
+                // The filename is in the semantics, not the visible label: TalkBack announces
+                // "Open report.pdf" while the button still reads "Open".
+                description = "Open $fileName",
+                onClick = onOpen,
+                testTag = "received_open",
+                modifier = Modifier.weight(1f),
+            )
+            ActionCell(
+                label = if (savingThis) "Saving..." else "Save as",
+                description = "Save $fileName to another location",
+                onClick = onSaveAs,
+                enabled = !saveBusy,
+                testTag = "received_save",
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ActionCell(
+                label = "Share",
+                description = "Share $fileName",
+                onClick = onShare,
+                testTag = "received_share",
+                modifier = Modifier.weight(1f),
+            )
+            ActionCell(
+                label = "Delete",
+                description = "Delete $fileName",
+                onClick = onDelete,
+                destructive = true,
+                testTag = "received_delete",
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+/** One cell of the action grid, at the platform minimum touch height. */
+@Composable
+private fun ActionCell(
+    label: String,
+    description: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    destructive: Boolean = false,
+    testTag: String? = null,
+) {
+    TextButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            // 48dp is Android's recommended minimum, and the constraint has to be explicit
+            // because a TextButton shrinks to its content.
+            .heightIn(min = 48.dp)
+            .then(if (testTag != null) Modifier.testTag(testTag) else Modifier)
+            .semantics { contentDescription = description },
+    ) {
+        Text(
+            label,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = if (destructive && enabled) {
+                MaterialTheme.colorScheme.error
+            } else {
+                Color.Unspecified
+            },
+        )
+    }
+}
+
+/** A finished save, with a way to dismiss it. */
+@Composable
+private fun SaveMessage(text: String, isError: Boolean, onDismiss: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f).testTag(if (isError) "save_failed" else "save_completed"),
+        )
+        TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("OK") }
     }
 }
 

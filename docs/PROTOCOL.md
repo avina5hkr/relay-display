@@ -112,6 +112,7 @@ rejected with `UNKNOWN_MESSAGE_TYPE` rather than ignored, so a downgrade is visi
 | 0x0049 | FILE_BATCH_OFFER | yes |
 | 0x004A | FILE_BATCH_ACCEPT | yes |
 | 0x004B | FILE_BATCH_REJECT | yes |
+| 0x004C | FILE_BATCH_CANCEL | yes |
 | 0x0050–0x0054 | MIRROR_START / CONFIG / FRAME / STOP / KEYFRAME_REQUEST | yes |
 
 "Secure" means the message is refused if it arrives before the session is encrypted. That check
@@ -183,7 +184,7 @@ Receiver rules, all enforced in `TransferReceiver`:
 The final name comes from the transfer UUID. The peer's display name is sanitized and used only
 as a label.
 
-## Generic file transfer (capability `file-v1`)
+## Generic file transfer (capability `file-v2`)
 
 Added alongside the existing image and PDF transfer, reusing the same
 `CONTENT_OFFER / TRANSFER_START / TRANSFER_CHUNK / TRANSFER_COMPLETE` sequence rather than
@@ -194,11 +195,22 @@ the receiver never decodes these bytes, so any MIME type is accepted and content
 applied — sniffing cannot protect something nothing parses, and would reject most ordinary files
 whose leading bytes this app does not recognise.
 
-**Version lives in the capability string.** A display announces `file-v1` in its HELLO
-capabilities. A controller checks for it before offering a file batch and, if it is absent, tells
-the user that file transfer needs a newer Relay Display on the other phone. Nothing is sent. A
-future incompatible format announces `file-v2`, which an older peer simply will not match, so an
-old build keeps failing cleanly rather than half-parsing a newer wire format.
+**Version lives in the capability string, and this build speaks only `file-v2`.** A display
+announces `file-v2` in its HELLO capabilities. A controller checks for it before offering a batch
+and, if it is absent, tells the user that file transfer needs a newer Relay Display on the other
+phone. Nothing is sent.
+
+`file-v1` is **not** advertised alongside it. v1 was not merely older, it was unsafe: its manifest
+carried no transfer id and no digest, and the per-file `CONTENT_OFFER` carried no batch identity,
+so an accepted batch could be followed by entirely different files. Announcing both versions would
+mean either honouring those unbound offers -- the vulnerability -- or advertising a capability this
+build refuses to act on. A peer announcing only `file-v1` therefore takes the same path as an
+unversioned peer: a clear "needs a newer version" refusal before anything is sent. No release ever
+shipped v1, so nothing in the field is broken by this. `FileCapabilityTest` pins the negotiation,
+including a future peer that advertises both (it is spoken to as v2).
+
+Image and PDF presentation transfers are unaffected: they are gated on the `image` and `pdf`
+capabilities and work against any peer, including one too old for generic files.
 
 **Zero-byte files are accepted for `FILE` only.** An empty generic file is ordinary; an empty
 image or PDF is not, because there is nothing for a decoder to open. The offer gate is therefore
@@ -211,42 +223,119 @@ selection; each file then streams through the `CONTENT_OFFER / TRANSFER_*` machi
 existed and was already tested.
 
 ```
-Controller                                  Display
-    | FILE_BATCH_OFFER  batchId, senderName, manifest
-    |------------------------------------------->|   (user is asked)
-    |                                            |
-    |        FILE_BATCH_ACCEPT batchId           |
-    |<-------------------------------------------|
-    |                                            |
-    |   ... per file, sequentially:              |
-    |   CONTENT_OFFER / TRANSFER_START /         |
-    |   TRANSFER_CHUNK* / TRANSFER_COMPLETE /    |
-    |   SHOW_FILE(kind=FILE)                     |
-    |------------------------------------------->|
+Controller                                       Display
+    | FILE_BATCH_OFFER  batchId, manifest[]
+    |---------------------------------------------->|   (user is asked)
+    |                                               |
+    |        FILE_BATCH_ACCEPT batchId              |
+    |<----------------------------------------------|
+    |                                               |
+    |   ... per file, sequentially, in manifest order:
+    |   CONTENT_OFFER(batchId, transferId, index) /
+    |   TRANSFER_START / TRANSFER_CHUNK* /
+    |   TRANSFER_COMPLETE / SHOW_FILE(kind=FILE)    |
+    |---------------------------------------------->|
 ```
 
-Or `FILE_BATCH_REJECT batchId, errorCode` in place of the accept, which ends the exchange. Nothing
-is sent after a rejection.
+In place of the accept, either `FILE_BATCH_REJECT batchId, errorCode` (the user said no, or a limit
+was broken) or nothing, in which case the sender's decision timeout fires. Either side may send
+`FILE_BATCH_CANCEL batchId, errorCode` at any point to end the batch.
 
-**Consent is required and it is scoped.** A `CONTENT_OFFER` with `kind = FILE` that does not have
-an accepted batch behind it is refused with `PERMISSION_DENIED`. Being paired establishes which
-phone is on the other end; it does not establish that its user's request is wanted right now. The
-acceptance is spent once the batch's promised file count has arrived, and is discarded whenever the
-session ends, so consent never outlives the connection it was given on.
+### Consent is bound to specific files
 
-**Batch manifest encoding.** The TLV layer keys fields by tag in a map, so it has no repeated
-fields and the file list needs a nested encoding inside one `bytes` field:
+**Every manifest entry carries a pre-allocated `transferId` and the SHA-256 of the exact bytes that
+will be sent**, and every generic `CONTENT_OFFER` carries the `batchId` and the manifest index. The
+receiver keeps the accepted manifest immutable, keyed by transfer id, and matches each offer
+against it *before* creating a partial file. An offer is refused unless all of the following hold:
+
+| Check | Refusal code |
+| --- | --- |
+| a batch is accepted and not yet terminal | `PERMISSION_DENIED` |
+| the offer names a batch at all | `PERMISSION_DENIED` |
+| the `batchId` matches the accepted one | `PERMISSION_DENIED` |
+| the `transferId` exists in the accepted manifest | `PERMISSION_DENIED` |
+| that entry has not already started or finished | `BUSY` / `PERMISSION_DENIED` |
+| the manifest index agrees | `MALFORMED_FRAME` |
+| the size matches exactly | `MALFORMED_FRAME` |
+| the SHA-256 matches | `MALFORMED_FRAME` |
+| the MIME type matches, normalised | `UNSUPPORTED_FORMAT` |
+| the display name matches, normalised | `MALFORMED_FRAME` |
+
+Because each entry can be consumed exactly once and an unknown transfer id is refused, no unlisted
+file can be accepted and no extra file can appear beyond the accepted count -- the count is a
+consequence of the manifest, not a separate counter that a peer could avoid advancing.
+
+**Why this is a version change rather than stricter checks.** In `file-v1` there was nothing to
+check *against*: the manifest identified no transfer and pinned no content, and the offer named no
+batch. The receiver's only gate was a boolean saying some batch had been accepted, so a controller
+could display one manifest and send different files, and a peer that never sent the closing
+`SHOW_FILE` left consent alive for the life of the session. Pairing authenticates a peer; it does
+not make everything that peer later says true.
+
+**One normalization policy, applied to both sides.** Names are compared after passing through the
+app's own `FilenameSanitizer` at the wire byte limit, so the compared form is exactly the form that
+would be written to disk and shown to the user. MIME types are compared trimmed and lowercased,
+with blank meaning the fallback. Comparing raw wire strings would let a name that sanitises to the
+approved one read as a different file; comparing unsanitised names would compare values the user
+was never shown.
+
+**Manifest entry encoding** (nested inside one TLV field, because the TLV layer keys fields by tag
+and so has no repeated fields):
 
 ```
-per entry:  u16 nameLen | name (UTF-8) | u16 mimeLen | mime (UTF-8) | i64 sizeBytes
+per entry:  transferId:16 | u16 nameLen | name (UTF-8) | u16 mimeLen | mime (UTF-8)
+            | i64 sizeBytes | sha256:32
 ```
 
-Entry order is meaningful: it is the order files are sent, and the receiver's "3 of 7" counts
-against it. The decoder bounds the whole field before parsing, requires the entry count to match
-the `u8` count in the header, rejects any length that exceeds the remaining buffer or its own
-field limit, and treats trailing bytes as `MALFORMED_FRAME` rather than ignoring them.
+The decoder bounds the whole field before parsing, requires the entry count to match the `u8` count
+in the header, refuses a manifest that names the same transfer id twice (an entry the receiver
+cannot tell apart from another is exactly what the binding prevents), rejects any length exceeding
+the remaining buffer or its own field limit, and treats trailing bytes as `MALFORMED_FRAME`.
 
-### Queue ordering is part of the transfer contract
+**No sender name on the wire.** `file-v1`'s `FILE_BATCH_OFFER` carried a `senderName` string and
+the consent dialog displayed it, which meant the identity the user was shown came from inside a
+message the peer composed. The field is gone; the dialog uses the authenticated peer name from the
+handshake. Tag 2 is left unused rather than recycled.
+
+### Batch state machine
+
+One terminal state per batch, on each side, and cleanup that is safe to run repeatedly.
+
+**Receiving side.** `offered` (awaiting consent, with a local expiry) then either `accepted`
+(transfers may run) or straight to a terminal state. Terminal: `completed`, `rejected`,
+`cancelled`, `expired`, `disconnected`. Each manifest entry additionally moves through
+`pending -> receiving -> received | failed | cancelled`, and the batch is finished when no entry is
+pending or receiving.
+
+**Sending side.** `preparing` (spooling) then `awaiting consent` then `transferring`, and terminal
+as `completed`, `rejected`, `cancelled`, `timed out` or `disconnected`. Per file:
+`waiting -> accepted -> sending -> verifying -> complete | rejected | cancelled | failed`.
+
+Rules the implementation holds to:
+
+- **Cancellation notifies the peer first, then cancels the coroutine.** This is the fix for a real
+  bug: cancelling used to call `batchJob.cancel()` and nothing else, and because `streamOneFile`
+  rethrows `CancellationException` before it can send anything, the Display was never told. It kept
+  its consent, its open partial and its "transfer running" state, and refused every later batch as
+  `BUSY` until the session ended. `FILE_BATCH_CANCEL` goes out on the still-live session, together
+  with a `TRANSFER_CANCEL` for the individual transfer if one is mid-flight, and only then is the
+  coroutine cancelled.
+- **The sender's consent timeout tells the Display**, so a dialog still on screen there is
+  dismissed rather than outliving the sender's patience.
+- **The receiver also expires an unanswered offer locally** after `CONSENT_EXPIRY_MS`, which is
+  longer than the sender's decision timeout. That is the backstop for a lost cancel or a
+  force-stopped controller; without it a prompt that can never be answered would block every later
+  batch.
+- **Late or unknown accept/reject/cancel messages are ignored**, not treated as errors: a cancel
+  naming a batch that already ended is what a crossing cancel looks like.
+- **Every terminal path clears** the accepted manifest, the pending offer and its expiry job, the
+  dialog state, the inbound receiver and its `.part` file, the outbound spool files, and every
+  pending deferred decision and acknowledgement.
+- **Files already received and hash-verified are kept.** Those bytes passed every check and the
+  user was told they arrived. Consent still expires, which is the part that matters for safety.
+- **After a cancellation or failure a new batch can be sent immediately**, with no reconnect.
+
+### Queue ordering is part of the transfer contract### Queue ordering is part of the transfer contract
 
 `TRANSFER_CHUNK` and `TRANSFER_COMPLETE` travel on the **same** queue (`BULK`), and that is a
 requirement rather than an implementation detail. The session writer is strict priority: anything
@@ -299,6 +388,8 @@ Enforced by `FileTransferPolicy` before anything is allocated, opened or written
 | Filename | 255 bytes **and** 120 characters, whole code points only, extension preserved |
 | MIME string | 128 bytes, no control characters |
 | Retention expiry | 24 h |
+| Unanswered consent prompt | 150 s (receiver-side expiry) |
+| Sender's decision timeout | 120 s |
 
 **The retention budget must be able to hold one whole legal batch.** `ContentCache` takes its byte
 and entry budgets from `FileTransferPolicy` rather than restating them, and

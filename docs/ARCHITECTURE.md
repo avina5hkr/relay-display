@@ -152,9 +152,13 @@ policy decision:
 | Limits, metadata and batch validation, executable warning | `content/FileTransferPolicy.kt` (pure, no Android) |
 | Batch and per-file phases | `content/FileBatchState.kt` (pure, no Android) |
 | An offered batch awaiting a decision | `content/IncomingBatch.kt` (pure, no Android) |
+| The approved manifest and per-file states | `content/AcceptedBatch.kt` (pure, no Android) |
+| Reading a source once, into app-private scratch | `content/SourceSpool.kt` |
+| Copying a received file out, off the main thread | `content/FileExport.kt` |
 | A stored, verified file and its metadata sidecar | `content/ReceivedFiles.kt` |
 | Untrusted filenames | `content/FilenameSanitizer` in `UrlValidation.kt` |
-| Measuring and digesting a source before offering | `ContentSource.prepare()` in `content/ContentSource.kt` |
+| Spooling, measuring and digesting before offering | `ContentSource.spoolTo()` in `content/SourceSpool.kt` |
+| Sending the prepared bytes | `SpooledContentSource` in `content/ContentSource.kt` |
 | Reading a picked file through the resolver | `UriContentSource.forGenericFile()` |
 | Batch driving: offer, await consent, stream in order | `content/ContentRouter.kt` (`sendFileBatch`, `runBatch`) |
 | Receiver stream lifecycle, digest, atomic promote | `content/TransferReceiver.kt` (existing, extended) |
@@ -176,6 +180,34 @@ the Image and PDF tiles already followed, since the next thing the user sees is 
 either way. `SendFocus` was deliberately *not* extended with a `FILES` value: it describes the text
 composer (draft label, "Show as text"), so a file entry in it would have forced meaningless labels
 and added a bogus button to the composer's list of alternatives.
+
+**Consent is a state machine, not a flag.** `AcceptedBatch` holds the manifest the user approved,
+keyed by transfer id, with an explicit state per entry, and every incoming generic offer is matched
+against it before a partial file exists. It replaced a `batchAccepted` boolean, an
+`acceptedBatchId` that was assigned and never read, and two counters -- a shape that could not
+answer "is this one of the files I agreed to?". Being pure Kotlin, the whole matching policy is
+unit-tested in milliseconds.
+
+**One terminal path per batch, on each side.** `ContentRouter.endBatch` on the receiving side and
+`finishOutbound` on the sending side are the only places a batch ends, and both are safe to call
+repeatedly. Everything funnels through them: rejection, local expiry, a peer cancel, completion,
+and session teardown. Scattering that cleanup was how the old code left consent set after a
+cancellation. Cancellation notifies the peer *before* cancelling the coroutine, because
+`streamOneFile` rethrows `CancellationException` before it could send anything.
+
+**Files are read once and sent from a spool.** `SourceSpool` gives each outbound file an
+app-private copy, and the manifest describes that copy. A `ContentResolver` makes no promise that
+two reads of the same URI agree, and the transmit path used to be that second read. Spool files are
+never exposed through the FileProvider and are swept at startup as well as on every terminal path.
+
+**Cache directories are separated by purpose**, not by whether a metadata sidecar happened to be
+written: `received/` for generic user files (the only directory the FileProvider exposes),
+`presentation/` for images and PDFs, `incoming/` for partials, `spool/` for outbound copies. They
+shared one `ready/` directory before, and the received-files list enumerated all of it, so an image
+sent last week reappeared as a UUID with `application/octet-stream`. `ContentCache.migrateLegacyLayout()`
+classifies an existing installation once, at startup: a payload with a valid sidecar was a generic
+file and moves to `received/`, anything else was a presentation payload and moves to
+`presentation/`. Nothing is deleted for lacking metadata, and the migration is idempotent.
 
 **One streaming implementation, two callers.** `ContentRouter.streamOneFile` owns the whole
 per-file protocol exchange, and both the presentation path (`sendFile`, for images and PDFs) and

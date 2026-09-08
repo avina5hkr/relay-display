@@ -90,10 +90,10 @@ class GenericFileReceiveTest {
      * A generic file is promoted with a sidecar, so a raw directory listing counts two entries per
      * file. The sidecar is real and tested separately; these assertions are about payloads.
      */
-    private fun readyFiles() = File(cacheRoot, "ready").listFiles()
+    private fun readyFiles() = File(cacheRoot, ContentCache.RECEIVED_DIR).listFiles()
         ?.filterNot { it.name.endsWith(".meta") }
         .orEmpty()
-    private fun partialFiles() = File(cacheRoot, "incoming").listFiles()?.toList().orEmpty()
+    private fun partialFiles() = File(cacheRoot, ContentCache.INCOMING_DIR).listFiles()?.toList().orEmpty()
 
     // -- the happy path ----------------------------------------------------------------------
 
@@ -264,7 +264,8 @@ class GenericFileReceiveTest {
         val r = started(offer(name = "../../../../etc/passwd"))
         assertTrue(deliver(r, payload) is TransferOutcome.Finished)
         // Nothing outside the cache root, and the promoted name comes from the transfer id.
-        assertTrue(File(cacheRoot, "ready").listFiles()!!.all { it.parentFile == File(cacheRoot, "ready") })
+        assertTrue(File(cacheRoot, ContentCache.RECEIVED_DIR).listFiles()!!
+                .all { it.parentFile == File(cacheRoot, ContentCache.RECEIVED_DIR) })
         assertFalse(File("/etc/passwd").let { it.exists() && it.length() == payload.size.toLong() })
     }
 

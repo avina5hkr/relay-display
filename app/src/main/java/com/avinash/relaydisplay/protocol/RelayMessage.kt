@@ -230,6 +230,23 @@ data class ContentOffer(
     val mimeType: String,
     val displayName: String,
     val sha256: ByteArray,
+    /**
+     * Which accepted batch this file belongs to, for [ContentKind.FILE] only.
+     *
+     * Null for image and PDF presentation transfers, which are not batched and are not gated on a
+     * consent dialog. For a generic file it is mandatory: the receiver matches the offer against
+     * the manifest the user approved, and an offer that names no batch cannot be matched against
+     * anything and is refused.
+     */
+    val batchId: UUID? = null,
+    /**
+     * Position in the accepted manifest, for [ContentKind.FILE] only.
+     *
+     * Not needed to find the entry -- the transfer id does that -- but it pins the *order* the
+     * sender promised, which is the order the receiver's progress counts against. A mismatch means
+     * the two sides disagree about the batch, so it is refused rather than reordered.
+     */
+    val manifestIndex: Int? = null,
 ) : RelayMessage {
     override val type get() = MessageType.CONTENT_OFFER
     override fun equals(other: Any?) = this === other || (other is ContentOffer && messageEquals(this, other))
@@ -293,35 +310,69 @@ data class ShowFile(
 }
 
 /**
- * One file's metadata inside a [FileBatchOffer].
+ * One file's metadata inside a [FileBatchOffer], and the thing consent is given to.
  *
- * No transfer id: ids are allocated per file when that file's own CONTENT_OFFER goes out. This is
- * a manifest for the confirmation dialog, not a transfer handle.
+ * Every field here is part of the binding, not decoration. The `file-v1` manifest carried only a
+ * name, a type and a size, and the per-file `CONTENT_OFFER` that followed carried no batch
+ * identity at all, so once a batch was accepted the receiver had no way to tell whether the file
+ * arriving was one it had agreed to. A controller could show one manifest and send different
+ * files. Pairing authenticates the peer; it does not make everything the peer later says true.
+ *
+ * The transfer id is therefore allocated *before* the offer goes out and travels in the manifest,
+ * and the digest travels with it, so the receiver can match an incoming offer against the exact
+ * entry the user approved and refuse anything else before a byte is written.
  */
 data class FileManifestEntry(
+    /**
+     * Allocated by the sender before the batch is offered, so consent names a specific transfer.
+     */
+    val transferId: UUID,
     val displayName: String,
     val mimeType: String,
     /**
      * Measured, never declared.
      *
-     * The sender runs a preparation pass before offering, so this is the real length of the bytes
-     * that will arrive. There is deliberately no "unknown" sentinel on the wire: an unknown size
-     * is resolved on the sending side, so the receiver can always show a real total and check it
-     * against its own limits.
+     * The sender spools each file to app-private storage before offering, so this is the real
+     * length of the bytes that will be sent. There is deliberately no "unknown" sentinel on the
+     * wire: an unknown size is resolved on the sending side, so the receiver can always show a
+     * real total and check it against its own limits.
      */
     val sizeBytes: Long,
-)
+    /** SHA-256 of the exact bytes that will be sent. Compared against the per-file offer. */
+    val sha256: ByteArray,
+) {
+    // ByteArray in a data class: the generated equals compares identity, which is never what a
+    // caller means for a digest.
+    override fun equals(other: Any?): Boolean = this === other || (
+        other is FileManifestEntry &&
+            transferId == other.transferId &&
+            displayName == other.displayName &&
+            mimeType == other.mimeType &&
+            sizeBytes == other.sizeBytes &&
+            sha256.contentEquals(other.sha256)
+        )
+
+    override fun hashCode(): Int {
+        var result = transferId.hashCode()
+        result = 31 * result + displayName.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + sizeBytes.hashCode()
+        result = 31 * result + sha256.contentHashCode()
+        return result
+    }
+}
 
 /**
  * Controller -> Display: the whole selection, for a single confirmation.
  *
- * Carries the sender's own name so the Display can say who is asking without having to correlate
- * against connection state at dialog time.
+ * Deliberately carries **no sender name**. `file-v1` included one and the dialog displayed it,
+ * which meant the identity the user was shown came from inside a message the peer composed. The
+ * Display already knows who it is talking to -- the handshake established it -- so the consent UI
+ * uses the authenticated peer name from the session and this message cannot influence it.
  */
 data class FileBatchOffer(
     override val id: UUID,
     val batchId: UUID,
-    val senderName: String,
     val files: List<FileManifestEntry>,
 ) : RelayMessage {
     override val type get() = MessageType.FILE_BATCH_OFFER
@@ -339,6 +390,26 @@ data class FileBatchReject(
     val errorCode: ProtocolErrorCode,
 ) : RelayMessage {
     override val type get() = MessageType.FILE_BATCH_REJECT
+}
+
+/**
+ * Either direction: this batch is over, stop.
+ *
+ * The explicit terminal event the protocol was missing. Cancelling used to be a purely local act
+ * on the controller -- cancel the coroutine, update local state -- so the Display kept its
+ * accepted batch, its open partial and its "a transfer is in progress" state, and the next batch
+ * was refused as BUSY until the session ended.
+ *
+ * Idempotent by construction: it names a batch rather than describing a transition, so a repeat,
+ * a crossing cancel from the other side, or one arriving after the batch already ended is safe to
+ * apply again.
+ */
+data class FileBatchCancel(
+    override val id: UUID,
+    val batchId: UUID,
+    val errorCode: ProtocolErrorCode,
+) : RelayMessage {
+    override val type get() = MessageType.FILE_BATCH_CANCEL
 }
 
 data class PdfPageCommand(

@@ -40,13 +40,38 @@ class ContentCache(
     // Application.onCreate, and touching the filesystem there is main-thread disk I/O -- which
     // StrictMode flags and which costs real milliseconds on the older phone. Directories are
     // created on first use instead, always from a background dispatcher.
-    private val incoming = File(root, "incoming")
-    private val ready = File(root, "ready")
+    private val incoming = File(root, INCOMING_DIR)
+
+    /**
+     * Verified image and PDF payloads, for the presentation screen.
+     *
+     * Separate from [received] because the two have different lifetimes and different audiences. A
+     * presentation payload is shown once and forgotten; a received file is something the user
+     * comes back to. They shared one directory until now, and `receivedFiles()` enumerated
+     * whatever it found there, so an image sent last week reappeared in "Received files" as a
+     * UUID with `application/octet-stream` -- a file the user never chose to keep, labelled with
+     * nothing they would recognise.
+     */
+    private val presentation = File(root, PRESENTATION_DIR)
+
+    /**
+     * Verified generic files the user received.
+     *
+     * The only directory the FileProvider exposes, and the only one `receivedFiles()` reads. Being
+     * a directory rather than a metadata convention is what makes the distinction hold: a file
+     * here *is* a received file, whether or not its sidecar survived.
+     */
+    private val received = File(root, RECEIVED_DIR)
 
     private fun ensureDirectories() {
         if (!incoming.isDirectory) incoming.mkdirs()
-        if (!ready.isDirectory) ready.mkdirs()
+        if (!presentation.isDirectory) presentation.mkdirs()
+        if (!received.isDirectory) received.mkdirs()
     }
+
+    /** Where a promoted payload belongs, by what it is for. */
+    private fun destinationFor(metadata: PromotedMetadata?): File =
+        if (metadata != null) received else presentation
 
     /**
      * A private, uniquely named file to stream into.
@@ -84,7 +109,10 @@ class ContentCache(
     ): File? {
         ensureDirectories()
         val suffix = extension?.let { safeExtension(it) }.orEmpty()
-        val target = File(ready, "$transferId$suffix")
+        // Metadata present means a generic user file; absent means a presentation payload. That
+        // one decision is what keeps the two kinds apart for the rest of their lives.
+        val destination = destinationFor(metadata)
+        val target = File(destination, "$transferId$suffix")
         return try {
             if (target.exists()) target.delete()
             if (partial.renameTo(target)) {
@@ -93,7 +121,7 @@ class ContentCache(
                     // A failure here costs the name, not the file, so it is not fatal.
                     try {
                         ReceivedFileMetadata.write(
-                            target = File(ready, "$transferId${ReceivedFileMetadata.SUFFIX}"),
+                            target = File(destination, "$transferId${ReceivedFileMetadata.SUFFIX}"),
                             displayName = metadata.displayName,
                             mimeType = metadata.mimeType,
                             sizeBytes = target.length(),
@@ -127,7 +155,7 @@ class ContentCache(
         .mapNotNull { file ->
             val id = runCatching { UUID.fromString(file.nameWithoutExtension) }.getOrNull()
                 ?: return@mapNotNull null
-            val sidecar = File(ready, "$id${ReceivedFileMetadata.SUFFIX}")
+            val sidecar = File(received, "$id${ReceivedFileMetadata.SUFFIX}")
             val parsed = ReceivedFileMetadata.read(sidecar, file)
             ReceivedFile(
                 transferId = id,
@@ -143,7 +171,7 @@ class ContentCache(
     /** Deletes one received file and its sidecar. */
     fun deleteReceived(transferId: UUID): Boolean {
         var deleted = false
-        ready.listFiles()?.forEach { file ->
+        received.listFiles()?.forEach { file ->
             if (file.isFile && file.nameWithoutExtension == transferId.toString()) {
                 if (file.delete()) deleted = true
             }
@@ -151,12 +179,62 @@ class ContentCache(
         return deleted
     }
 
+    /** Scratch space for outbound files, so a source is read once. See [SourceSpool]. */
+    val spool: SourceSpool by lazy { SourceSpool(root) }
+
     /** Free space on the volume holding the cache, for deciding whether an offer can be accepted. */
     fun usableSpaceBytes(): Long = try {
         ensureDirectories()
         availableSpaceProvider(root)
     } catch (e: SecurityException) {
         0
+    }
+
+    /**
+     * Moves generic received files out of the old shared `ready/` directory.
+     *
+     * Installations that ran the single-directory layout have both kinds of payload in `ready/`.
+     * A payload there with a valid `.meta` sidecar was a generic received file, so it moves to
+     * [received] and keeps appearing in the list. Everything else was a presentation payload and
+     * moves to [presentation], which keeps it out of the list without deleting it.
+     *
+     * Nothing is deleted for lacking metadata: a file the user was told they received is theirs,
+     * and a missing sidecar is this app's problem rather than a reason to lose their file. The
+     * conservative choice is to treat unlabelled payloads as presentation leftovers, which is
+     * what they overwhelmingly are -- images and PDFs were the only kinds that ever promoted
+     * without a sidecar.
+     *
+     * Idempotent: once `ready/` is gone or empty there is nothing to do, and a name that already
+     * exists at the destination is left alone rather than overwritten.
+     */
+    fun migrateLegacyLayout(): Int {
+        val legacy = File(root, LEGACY_READY_DIR)
+        if (!legacy.isDirectory) return 0
+        ensureDirectories()
+
+        var moved = 0
+        val payloads = legacy.listFiles()
+            ?.filter { it.isFile && !it.name.endsWith(ReceivedFileMetadata.SUFFIX) }
+            .orEmpty()
+        for (payload in payloads) {
+            val id = payload.nameWithoutExtension
+            val sidecar = File(legacy, "$id${ReceivedFileMetadata.SUFFIX}")
+            val isGeneric = ReceivedFileMetadata.read(sidecar, payload) != null
+            val destination = if (isGeneric) received else presentation
+            val target = File(destination, payload.name)
+            if (!target.exists() && payload.renameTo(target)) {
+                moved++
+                if (isGeneric) {
+                    val sidecarTarget = File(destination, sidecar.name)
+                    if (!sidecarTarget.exists()) sidecar.renameTo(sidecarTarget)
+                }
+            }
+        }
+        // Sidecars whose payload has gone describe nothing.
+        legacy.listFiles()?.forEach { if (it.isFile && it.name.endsWith(ReceivedFileMetadata.SUFFIX)) it.delete() }
+        // Only succeeds when empty, which is exactly the condition for being finished.
+        legacy.delete()
+        return moved
     }
 
     /** Deletes any `.part` files left by a crash or a killed process. Call at startup. */
@@ -189,13 +267,19 @@ class ContentCache(
 
     fun clear() {
         incoming.listFiles()?.forEach { it.delete() }
-        ready.listFiles()?.forEach { it.delete() }
+        presentation.listFiles()?.forEach { it.delete() }
+        received.listFiles()?.forEach { it.delete() }
+        spool.deleteAll()
     }
 
-    fun readyFiles(): List<File> = ready.listFiles()?.filter { it.isFile }.orEmpty()
+    /** Everything in the received-files directory, sidecars included. */
+    fun readyFiles(): List<File> = received.listFiles()?.filter { it.isFile }.orEmpty()
+
+    /** Promoted presentation payloads. Never surfaced as received files. */
+    fun presentationFiles(): List<File> = presentation.listFiles()?.filter { it.isFile }.orEmpty()
 
     /**
-     * The received files themselves, excluding metadata sidecars.
+     * The received payloads themselves, excluding metadata sidecars.
      *
      * The distinction matters: a sidecar must not count as an entry against the retention budget
      * or the batch limits, or half the budget would be spent on three-line text files and the
@@ -225,7 +309,7 @@ class ContentCache(
     /** Deletes a payload and the sidecar that describes it. */
     private fun deleteWithSidecar(payload: File): Boolean {
         val id = payload.nameWithoutExtension
-        File(ready, "$id${ReceivedFileMetadata.SUFFIX}").delete()
+        File(received, "$id${ReceivedFileMetadata.SUFFIX}").delete()
         return payload.delete()
     }
 
@@ -246,6 +330,17 @@ class ContentCache(
         const val DEFAULT_MAX_BYTES = FileTransferPolicy.MAX_PENDING_BYTES
         const val DEFAULT_MAX_ENTRIES = FileTransferPolicy.MAX_PENDING_FILES
         const val DIRECTORY_NAME = "relay_cache"
+
+        const val INCOMING_DIR = "incoming"
+
+        /** Verified generic files. The only directory the FileProvider exposes. */
+        const val RECEIVED_DIR = "received"
+
+        /** Verified image and PDF payloads for the presentation screen. Not exposed. */
+        const val PRESENTATION_DIR = "presentation"
+
+        /** The pre-split directory, read once by [migrateLegacyLayout] and then removed. */
+        const val LEGACY_READY_DIR = "ready"
 
         /** Headroom kept free so accepting a transfer never fills the volume completely. */
         const val STORAGE_HEADROOM_BYTES = 32L * 1024 * 1024

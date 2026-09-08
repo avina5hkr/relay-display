@@ -8,18 +8,24 @@
   app-private data, so the root is kept as narrow as the feature allows.
 
   The path must be the FULL path under cacheDir, including the "relay_cache" container:
-  ContentCache puts files in <cacheDir>/relay_cache/ready/. This said "ready/" for a while, which
-  resolves to <cacheDir>/ready/ and matches nothing, so the first real getUriForFile call threw
-  IllegalArgumentException and took the app down. It went unnoticed because nothing exercised the
-  provider until the received-files actions existed. Keep it in step with
-  ContentCache.DIRECTORY_NAME; FileProviderPathTest fails if it drifts again.
+  ContentCache puts generic received files in <cacheDir>/relay_cache/received/. This said "ready/"
+  for a while, which resolves to <cacheDir>/ready/ and matches nothing, so the first real
+  getUriForFile call threw IllegalArgumentException and took the app down. It went unnoticed
+  because nothing exercised the provider until the received-files actions existed. Keep it in step
+  with ContentCache.DIRECTORY_NAME and RECEIVED_DIR; FileProviderPathTest fails if it drifts.
 
-  "incoming/" is deliberately absent. Partials are unverified: their hash has not been checked, so
-  their bytes are whatever the peer sent. Granting a URI to one would hand another app a
-  half-written file that failed integrity checking, and nothing in the app needs to read a partial
-  back out through a content URI: the receiver holds its own File handle while writing.
+  Three sibling directories are deliberately absent:
+
+    * "incoming/" holds partials. Unverified: their hash has not been checked, so their bytes are
+      whatever the peer sent. Granting a URI to one would hand another app a half-written file
+      that failed integrity checking, and nothing here needs to read a partial back through a
+      content URI — the receiver holds its own File handle while writing.
+    * "presentation/" holds images and PDFs shown on screen. The user never asked to keep or
+      share those, and they are not part of the received-files feature.
+    * "spool/" holds outbound copies of the user's own documents, waiting to be sent. Nothing
+      outside this process has any reason to read them.
 -->
 <paths>
-    <!-- Verified, complete files, ready to open or share. -->
-    <cache-path name="received" path="relay_cache/ready/" />
+    <!-- Verified generic files the user received. The only thing shareable. -->
+    <cache-path name="received" path="relay_cache/received/" />
 </paths>

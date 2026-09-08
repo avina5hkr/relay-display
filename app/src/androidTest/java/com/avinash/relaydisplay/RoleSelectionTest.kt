@@ -7,6 +7,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.avinash.relaydisplay.domain.model.DeviceRole
 import kotlinx.coroutines.runBlocking
@@ -35,8 +36,13 @@ class RoleSelectionTest {
 
     @Test
     fun choosingControllerOpensTheControllerDashboard() {
-        compose.onNodeWithText("Controller", substring = false).performClick()
-        compose.onNodeWithTag("role_confirm").performClick()
+        compose.onNodeWithText("Controller", substring = false).performScrollTo().performClick()
+        // Scroll before clicking. The chooser is a scrolling column, so at a large font scale or
+        // in landscape the confirm button sits below the fold; performClick on an off-screen node
+        // taps a point outside the viewport and the tap simply does not land, which showed up as
+        // the navigation wait timing out rather than as a missed click. A real user scrolls, and
+        // so must the test.
+        compose.onNodeWithTag("role_confirm").performScrollTo().performClick()
         compose.waitUntil(TIMEOUT_MS) {
             compose.hasNodeWithTag("primary_action")
         }
@@ -45,8 +51,8 @@ class RoleSelectionTest {
 
     @Test
     fun choosingDisplayOpensTheDisplayDashboard() {
-        compose.onNodeWithText("Companion display").performClick()
-        compose.onNodeWithTag("role_confirm").performClick()
+        compose.onNodeWithText("Companion display").performScrollTo().performClick()
+        compose.onNodeWithTag("role_confirm").performScrollTo().performClick()
         compose.waitUntil(TIMEOUT_MS) {
             compose.hasNodeWithTag("display_pair")
         }

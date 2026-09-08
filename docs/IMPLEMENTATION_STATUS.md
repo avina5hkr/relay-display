@@ -130,19 +130,34 @@ Last updated after the Milestone 8 build.
 
 ## Generic file transfer
 
-**End to end, reachable from the app, and exercised on two phones.** Controller: Samsung SM-S908E
-(API 36). Display: Lenovo K33a42 (API 24). That run found two real defects that no unit test could
-reach — a FileProvider path that never matched the cache layout, and a transfer completion that
-could overtake its own final chunks — both since fixed and covered by tests. See
-`docs/TESTING.md` for the full matrix and what is still unverified. States below are what is true,
-not what is intended.
+**End to end, reachable from the app, and exercised on two phones — now on `file-v2`, which
+replaced `file-v1` after a code review found the batch consent was not bound to the files
+transferred.** Controller: Samsung SM-S908E (API 36). Display: Lenovo K33a42 (API 24). See
+`docs/TESTING.md` for the exact suites, counts and hardware evidence, and for what is still not
+tested. States below are what is true, not what is intended.
 
 | Piece | State |
 | --- | --- |
 | `ContentKind.FILE` wire code 3 | **Complete** |
-| `file-v1` capability, announced by the display | **Complete** |
+| `file-v2` capability, announced by the display | **Complete.** `file-v1` is deliberately not advertised: it was unsafe, not merely older. A v1-only peer gets a clear refusal. |
+| Manifest binding: transfer id + digest per entry, batch id + index on every offer | **Complete**, 25 unit tests |
+| Immutable accepted manifest with per-entry states | **Complete.** `AcceptedBatch`, pure Kotlin. Replaced a `batchAccepted` boolean and an `acceptedBatchId` that was never read. |
+| No peer-supplied sender name in the consent dialog | **Complete.** Removed from the wire; the dialog uses the authenticated peer name. |
+| `FILE_BATCH_CANCEL`, one terminal state per batch, idempotent cleanup | **Complete**, verified on hardware in three cancellation cases |
+| Batch cleanup is scoped to the batch that owns it | **Complete.** Cancellation is asynchronous, so a cancelled batch's `finally` could fire after the next batch had started and delete its spool file; the next send then failed with `ENOENT`. Found on hardware, pinned by `BatchLifecycleTest`. |
+| Consent prompt visible over a presentation or mirror | **Complete.** Hosted at the app root; it was inside the dashboard, which is not composed while the display shows content, so a batch offered during mirroring could not be accepted. |
+| A failed file cannot leave the receiver permanently BUSY | **Complete.** The receiver marks the entry failed and settles the batch itself; the sender also reports an incomplete batch. Three `AcceptedBatchTest` cases. |
+| Cancellation notifies the peer before cancelling the coroutine | **Complete**, and now unit-tested: `BatchLifecycleTest` drives two real routers over a loopback session and asserts the display receives `FILE_BATCH_CANCEL`. |
+| Receiver-initiated end (reject or expiry) releases the sender | **Complete.** The controller had no `FileBatchCancel` handler, so it sat in its 120 s decision timeout and refused the next batch; found by `BatchLifecycleTest`. |
+| Receiver-side expiry of an unanswered consent prompt | **Complete**, unit-tested with an injected expiry duration (no test waits out the real 150 s). Not exercised on hardware at the production duration. |
+| Outbound spooling: each source read exactly once | **Complete for generic files**, 13 unit tests; spool cleanup verified on hardware. **The image/PDF presentation path still reads its source twice** (`ContentSource.prepare` then reopen) and was left unchanged. A one-shot or changing provider stream there fails the receiver's digest check, which is a visible failure rather than wrong content, because those transfers have no manifest to disagree with. Worth migrating when that path is next touched. |
+| Save As off the main thread with observable state | **Complete**, 12 unit tests including a thread-identity assertion, 5 instrumentation tests, and a 19.9 MB hardware run with no ANR |
+| Cache split into `received/`, `presentation/`, `incoming/`, `spool/` | **Complete**, verified on hardware |
+| Legacy cache migration, idempotent, deletes nothing | **Complete**, 5 unit tests and one real installation migrated on the Lenovo |
+| Consent dialog usable at 20 files | **Complete.** Bounded scrollable list with a window-relative height cap, and the summary and executable warning both kept outside the scroll region. Instrumentation-tested on both phones in portrait and landscape at font scales 0.85, 1.3 and 1.5. Display-size enlargement **not tested**. |
+| Received-file actions as a 2x2 grid, >=48dp targets, TalkBack labels | **Complete**, instrumentation-tested on both phones |
 | `FILE_BATCH_OFFER / ACCEPT / REJECT`, bounded nested manifest | **Complete**, 13 codec tests including truncated, over-long, trailing-byte and overflowing frames |
-| "Peer too old" refusal, used by production code | **Complete.** `sendFileBatch` checks `peerCapabilities` and the Send screen says so before the user picks anything. Not exercised against a real old peer, because none exists — no version has been published. |
+| "Peer too old" refusal for a v1-only or unversioned peer | **Complete.** `sendFileBatch` checks `peerCapabilities` and the Send screen says so before the user picks anything. Not exercised against a real old peer, because none exists — no version has been published. |
 | Sizes measured before offering; no unknown-size sentinel on the wire | **Complete**, 12 tests. Replaces the old contradiction between the picker, this protocol and the receiver. |
 | Empty files, kind-aware | **Complete.** Zero bytes is valid for `FILE`, still invalid for `IMAGE`/`PDF`. |
 | Filename sanitising: byte **and** character limits, code-point safe, extension preserved | **Complete**, 22 tests including the ~180-character ASCII `.pdf` regression |
@@ -162,7 +177,7 @@ not what is intended.
 | **Foreground-service integration, notification progress** | **Deferred.** A batch sent with the app in the background is bounded by the existing session lifetime; there is no notification showing batch progress. |
 | **Resume after process death** | **Not implemented.** The protocol has no resume, partials are deleted rather than continued, and nothing claims otherwise. |
 | Instrumentation tests | **48 of 48 passing on both phones** (Lenovo API 24 and S22 API 36), including 13 file-transfer UI tests and 4 FileProvider path tests. |
-| Two-device transfer matrix | **Run.** 21 cases pass, including a 0-byte file, a 180-character filename, a 19.9 MB APK, restart persistence, reconnect without re-pairing, and the executable warning. Share, mid-flight cancel, retry-after-failure, concurrent mirroring and the batch limits at their boundaries are **not** exercised. |
+| Two-device transfer matrix | **Run.** 21 cases plus the full interruption matrix (network drop, both force-stops, five cancel/resend cycles, transfer during mirroring) pass, including a 0-byte file, a 180-character filename, a 19.9 MB APK, restart persistence, reconnect without re-pairing, and the executable warning. Share, mid-flight cancel, retry-after-failure, concurrent mirroring and the batch limits at their boundaries are **not** exercised. |
 
 ### Auto-accept: deferred on purpose
 

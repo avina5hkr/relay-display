@@ -166,6 +166,23 @@ class UriContentSource(
     }
 }
 
+/**
+ * A source over a file this app already wrote: the spool copy of a picked document.
+ *
+ * Exists so the transmit path takes a [ContentSource] whatever the bytes came from, while the
+ * bytes it actually reads are the prepared, measured, digested ones rather than a second read of
+ * a `ContentResolver` stream that may not repeat.
+ */
+class SpooledContentSource(
+    private val file: java.io.File,
+    override val mimeType: String,
+    override val displayName: String,
+    override val kind: ContentKind = ContentKind.FILE,
+) : ContentSource {
+    override val sizeBytes: Long get() = file.length()
+    override fun openStream(): InputStream = file.inputStream()
+}
+
 /** An in-memory source, used by tests and by anything that already holds the bytes. */
 class ByteArrayContentSource(
     private val bytes: ByteArray,
@@ -216,6 +233,14 @@ sealed interface PrepareResult {
 
 /**
  * Measures and digests a source in one bounded pass, before anything is offered.
+ *
+ * **Still reads the source twice overall**, because the transmit path reopens it. Generic file
+ * transfer no longer does this -- it spools to app-private storage first, see [spoolTo] -- but the
+ * image and PDF presentation path does, and was deliberately left alone rather than migrated in
+ * the same change. The consequence is bounded: a one-shot or changing provider stream makes an
+ * image or PDF fail the receiver's digest check, which is a clean visible failure rather than
+ * wrong content, because there is no manifest for those to disagree with. Worth migrating to
+ * [spoolTo] when the presentation path is next touched.
  *
  * This exists because a `ContentResolver` is not obliged to report a size, and the two places
  * that used to care disagreed about it: the picker refused anything without a length, while the

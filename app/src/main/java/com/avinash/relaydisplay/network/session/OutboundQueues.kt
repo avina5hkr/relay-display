@@ -6,6 +6,7 @@ import com.avinash.relaydisplay.protocol.ContentAccept
 import com.avinash.relaydisplay.protocol.ContentOffer
 import com.avinash.relaydisplay.protocol.ContentReject
 import com.avinash.relaydisplay.protocol.ErrorMessage
+import com.avinash.relaydisplay.protocol.FileBatchCancel
 import com.avinash.relaydisplay.protocol.FileBatchOffer
 import com.avinash.relaydisplay.protocol.FileBatchAccept
 import com.avinash.relaydisplay.protocol.FileBatchReject
@@ -96,7 +97,7 @@ fun RelayMessage.trafficClass(): TrafficClass = when (this) {
     // it can only make it arrive *earlier*, and it has to precede the chunks anyway.
     is ContentOffer, is ContentAccept, is ContentReject,
     is TransferStart, is TransferCancel,
-    is FileBatchOffer, is FileBatchAccept, is FileBatchReject,
+    is FileBatchOffer, is FileBatchAccept, is FileBatchReject, is FileBatchCancel,
     -> TrafficClass.CONTROL
 
     // File bodies. Backpressured, so a slow display slows the sender rather than filling its heap,

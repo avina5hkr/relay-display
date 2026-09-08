@@ -140,6 +140,208 @@ Not exercised on hardware: Share (the chooser path is the same code as Open, whi
 a transfer mid-flight, retry after a real failure, a batch running concurrently with an active
 mirror, and the 20-file/200 MiB limits at their boundaries.
 
+### file-v2 review fixes: tests and evidence
+
+Run: `./gradlew --no-daemon validateVersion verifyReleaseGuards testDebugUnitTest lintDebug
+assembleDebug assembleDebugAndroidTest`, plus `compileReleaseKotlin lintRelease minifyReleaseWithR8`
+for the release path (no signing secrets involved). **Unit tests: 568 run, 0 failed.** Lint: 24
+findings, all pre-existing (version-upgrade suggestions, unused strings, four
+`AutoboxingStateCreation` in `PresentationScreen.kt`), none in the files this work touched.
+
+| Suite | Tests | Covers |
+| --- | ---: | --- |
+| `AcceptedBatchTest` | 25 | exact match; wrong batch id; no batch at all; unknown transfer id; wrong manifest index; wrong name, MIME, size and digest (including a one-byte digest change); name and MIME normalisation applied to both sides; a traversal dressed as the approved name; extra file beyond the accepted count; replay of a completed file; a second offer of one in flight; re-offer after failure; entry state transitions and illegal ones; settling; idempotent cancellation keeping verified files; nothing offerable after cancellation; refusal reasons containing no peer content |
+| `SourceSpoolTest` | 13 | one-pass copy/measure/digest; zero-byte source; monotonic progress; a source that can only be opened once; a source that returns different bytes on its second open; exceeding the limit mid-read; exactly at the limit; throwing part way through; zero-byte reads not mistaken for EOF; a security failure on open; cancellation deleting the partial spool; the spool directory sweeping only its own files |
+| `FileExporterTest` | 12 | byte-for-byte copy; empty file; **the copy running off the calling thread**; never reading the file whole; an unopenable destination; a write failure mid-copy requesting cleanup; a short copy never reported as success; a security failure; unknown expected size; both streams closed on failure; zero-byte reads; cancellation requesting cleanup |
+| `FileCapabilityTest` | 7 | two updated peers negotiate; a v1-only peer is refused; no file capability; a peer advertising both is spoken to as v2; an unknown future version alone is not enough; image and PDF independent of the file version |
+| `ContentCacheRetentionTest` | 25 | the retention invariant and budgets; a full batch surviving receipt; metadata persistence, missing sidecar, size disagreement, a sidecar attempting a path; **a payload promoted without metadata is a presentation file, not a received file**; presentation and received not colliding; legacy migration of a generic file, of an unlabelled payload, idempotence, no legacy directory, an orphan sidecar; spool files swept and never listed; eviction and expiry |
+| `FileBatchManifestTest` | 17 | round trip with order preserved; a full 20-file batch; multi-byte names; empty MIME; transfer id and digest surviving byte-for-byte; a manifest naming the same transfer twice; truncated, trailing-byte, empty, over-limit, negative-size, oversize and overflowing frames; an inflated name-length prefix; encoding stability |
+| `MessageCodecTest` | 23 | a golden round-trip sample for **every** message type, now including `FILE_BATCH_CANCEL`, a bound generic `CONTENT_OFFER`, and an unbound image offer; determinism |
+| `OutboundPriorityTest` | 10 | `TransferComplete` sharing the chunk queue (the ordering race must not return); `TransferCancel` and `FileBatchCancel` overtaking the backlog; `TransferStart` on control; batch negotiation on control |
+
+Also still passing unchanged: `FileBatchStateTest` (20), `IncomingBatchTest` (13),
+`ReceivedFilenameTest` (22), `FileTransferPolicyTest` (20), `GenericFileReceiveTest` (19),
+`ContentPreparationTest` (12).
+
+### Batch lifecycle, over a real encrypted session
+
+`BatchLifecycleTest`, 12 tests. Two real `ContentRouter`s over the loopback transport, so the
+handshake, record encryption, the priority writer, both routers and both on-disk caches are all
+genuine and only the socket is replaced. That matters because the bug being pinned is an *ordering*
+bug, and ordering only exists on a real wire.
+
+| Case | What it proves |
+| --- | --- |
+| cancel while the consent prompt is open | `FILE_BATCH_CANCEL` actually reaches the display. Before the fix nothing was transmitted at all, because `streamOneFile` rethrows `CancellationException` before it can send. |
+| cancel during an active transfer | Same, with 40 MiB in flight. Deterministic: it polls until bytes are demonstrably moving, then cancels, rather than sleeping a guessed interval. |
+| cancel three times in a row | Idempotent; one clean terminal state. |
+| a cancel naming an unknown batch | Ignored, and the live batch is untouched. |
+| an accept arriving after the controller gave up | Ignored; the batch stays terminal and nothing restarts. |
+| an unanswered prompt expires locally | Prompt cleared, no partial, and the controller is told. Uses an injected expiry, so no test waits out the real 150 s. |
+| a new batch immediately after an expiry | Accepted, prompts again. |
+| a new batch immediately after a cancellation | Accepted and carried to completion. **This is the regression**: the display used to hold consent and refuse with `BUSY`. |
+| three cancel/resend cycles | No prompt, partial or spool file left after any round. |
+| an accepted batch delivers the file | Both sides terminal, consent spent, spool released. |
+| a generic offer with no accepted batch | Refused over the real wire; nothing written, no partial created. |
+| cancel, then immediately resend and accept | The second batch's spool file survives the first batch's late cleanup and the file actually arrives. Pins defect 3 below. |
+
+Every cancellation case asserts the same four things: no partial in `incoming/`, no spool file, no
+lingering consent, and a subsequent batch works.
+
+**Two defects these tests found, neither reachable by inspection:**
+
+1. **The controller had no handler for `FileBatchCancel`.** A receiver-initiated end -- the user
+   rejecting, or the consent prompt expiring -- left the sender sitting in its 120 s decision
+   timeout with `batchJob` still active, so the next batch was refused with "a batch is already
+   being sent". The same class of stuck state as the original bug, in the opposite direction.
+   Fixed by handling it on the controller side and running the same terminal cleanup.
+2. **The executable warning could be pushed out of the consent dialog.** With a 20-file manifest
+   in landscape at `font_scale` 1.3 on the Lenovo, the warning sat below the bounded file list and
+   fell outside the dialog. Found by running the instrumentation suite rotated and at a large font
+   scale. Fixed by moving the warning above the list -- both it and the summary are what the
+   decision is made on, so neither may be displaceable -- and by making the list's height cap a
+   fraction of the window rather than a fixed 200dp.
+
+### Interruption matrix, on the two phones
+
+Controller: SM-S908E (API 36, `R5CT238SFMB`). Display: Lenovo K33a42 (API 24, `252fce95`). Same
+debug APK on both, paired over the S22's hotspot by comparing the six-digit code (`220 940`,
+verified identical on both screens before confirming).
+
+| Case | Result | Evidence |
+| --- | --- | --- |
+| Network drop mid-transfer, reconnect, send again | **Pass** | Wi-Fi disabled on the companion during a 19.9 MB send; both sides ended cleanly; after re-enabling, both reconnected **without re-pairing** and a 38 MB two-file batch completed (`2/2 received`, `batch ended: completed`) |
+| Force-stop the controller mid-transfer, reopen, reconnect, send | **Pass** | display logged `batch ended: the connection ended`, partials 0; the spool file the killed process left was **swept at startup** (`swept 1 spooled file(s)`), 1 to 0; reconnected and sent again |
+| Force-stop the companion mid-transfer, reopen, reconnect, send | **Pass** | controller logged `session ended` and released its spool; the partial the killed companion left was swept at startup, 1 to 0; reconnected and a fresh send completed |
+| Five cancel/resend cycles, no reconnect | **Pass** | each round offered and cancelled; `partials=0 spool=0` after every round; no `BUSY` |
+| Cancel then immediately resend and accept | **Pass, after a fix** | see defect 3 below |
+| 19.9 MB transfer while mirroring is active | **Pass, after two fixes** | mirror `started 596x1280@24`; prompt shown **over** the mirror; `received FILE (19910151B)`, `batch ended: completed` in about 6 s; mirror service still running and still `showing MIRRORING` afterwards |
+
+After every interruption: no permanent `BUSY`, no stuck dialog, no partial in `incoming/`, no spool
+file, reconnection worked, another file sent successfully, and mirroring stayed active.
+
+### Three defects the interruption matrix found
+
+None was reachable by inspection or by any unit test that existed at the time.
+
+1. **A single failed file left the receiver permanently `BUSY`.** When one transfer failed
+   mid-flight, the receiver left its manifest entry `PENDING`, so the batch never settled, consent
+   never expired, and every later batch was refused as `BUSY` for the life of the session. The
+   sender did not report it either -- it ended its own batch without telling the receiver. Fixed on
+   both sides: the receiver marks the entry failed when a transfer aborts (self-healing, so it
+   recovers even if the notification is lost), and the sender sends `FILE_BATCH_CANCEL` whenever a
+   batch ends without delivering everything. The receiver's half is pinned by three
+   `AcceptedBatchTest` cases.
+2. **The consent prompt could not be seen while the companion was mirroring.** It was hosted inside
+   `DisplayHomeScreen`, but when the display is showing content or a mirror `RelayAppRoot` returns
+   early into `PresentationSurface`, so the prompt was never composed. A batch offered during
+   mirroring simply could not be accepted -- nothing was left stuck, because the sender's timeout
+   and the receiver's local expiry both fire, but the feature was unusable. Fixed by hosting the
+   dialog at the app root, above that early return; an `AlertDialog` gets its own window so it
+   draws over the presentation surface.
+3. **A cancelled batch's cleanup deleted the next batch's spool file.** `batchJob.cancel()` flips
+   `isActive` false immediately but the coroutine's `finally` runs later, so a cancelled batch's
+   cleanup could fire after the user had started the next one -- and it deleted whatever `outbound`
+   pointed at, which by then was the new batch. The next transfer then failed at stream time with
+   `FileNotFoundException ... ENOENT`, intermittently, depending on how long the user took to
+   accept. This is what the two "transient" failures reported earlier actually were. Fixed by
+   scoping cleanup to the batch that owns it (`releaseOutbound(batch)`), pinned by
+   `BatchLifecycleTest`.
+
+Two supporting observability gaps were closed on the way, because both defects were hidden behind
+messages that said nothing: the receiver's `BUSY` refusal was silent, and the sender reported only
+"could not read the file" without the exception. Defect 3 was found by adding that exception to the
+log.
+
+### Instrumentation, on both phones
+
+```
+adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s <serial> install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb -s <serial> shell am instrument -w -r \
+  com.avinash.relaydisplay.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+| Device | Serial | Result |
+| --- | --- | --- |
+| Lenovo K33a42, Android 7.0 (API 24) | `252fce95` (USB) | **OK (65 tests)** |
+| Samsung SM-S908E, Android 16 (API 36) | `R5CT238SFMB` (USB) | **OK (65 tests)** |
+
+Same debug APK on both, sha256 `6d30a340...`. New this round: a 20-file consent dialog keeping
+Accept and Reject reachable, reporting its total and sender, scrolling to its last file, and still
+showing the executable warning; per-row accessibility descriptions; all four received-file actions
+displayed with a >=48dp touch target and TalkBack labels naming the file; save-in-progress
+disabling a second save; save failure with dismissal; save completion; a save on one row not
+marking another; the list unaffected when idle.
+
+**Font scale and orientation, on the Lenovo.** The 26 `FileTransferUiTest` cases pass in every
+combination tried: portrait and landscape, at `font_scale` 0.85 (the phone's own setting), 1.3 and
+1.5. The **full 65-test suite now passes in every combination**: portrait and landscape at 0.85, 1.3 and
+1.5. Three tests previously failed at 1.3 and above --
+`RoleSelectionTest.choosingControllerOpensTheControllerDashboard`,
+`RoleSelectionTest.choosingDisplayOpensTheDisplayDashboard` and, in landscape,
+`DashboardChromeTest.tappingTheIconOpensSettings`. All three were **test defects, not UI defects**:
+the role chooser and the settings screen are both already scrolling columns, so the controls are
+present and reachable, but the tests clicked and asserted visibility without scrolling. At a large
+font scale the confirm button sits below the fold, `performClick` taps a point outside the viewport
+and the tap does not land, and `assertIsDisplayed` asks about actual visibility. Fixed by adding
+`performScrollTo()` before the interaction, which is what a user does. The device's font scale and rotation were restored to the user's own values afterwards
+(`font_scale` 0.85, `user_rotation` 0).
+
+**Read the instrumentation output, not the Gradle exit code.** `connectedDebugAndroidTest` on this
+setup has twice printed `BUILD SUCCESSFUL` while running **zero** tests, and once reported success
+after an install failure. Every count above comes from the `OK (N tests)` line of `am instrument`.
+
+### Two-device hardware verification, file-v2
+
+Controller: SM-S908E (API 36). Display: Lenovo K33a42 (API 24). Same debug APK on both, paired over
+Wi-Fi by comparing the six-digit code (`571 970`, verified identical on both screens before
+confirming).
+
+| Case | Result | Evidence |
+| --- | --- | --- |
+| Two-file batch offered with the bound manifest | **Pass** | prompt lists both names and sizes, sender shown as the authenticated peer name |
+| Per-file offer matched against the accepted manifest | **Pass** | display log `file 1 of 1 matched the accepted manifest` |
+| Batch reaches a terminal state on both sides | **Pass** | display `batch finished: 1/1 received` then `batch ended: completed`; controller `batch done: 1/1 sent` |
+| **Controller cancels before the companion answers** | **Pass** | display log `batch cancelled by the sender (CANCELLED)` then `batch ended: cancelled by the sender`; dialog dismissed; no files written |
+| **A new batch immediately after cancelling, no reconnect** | **Pass** | second offer accepted normally; no `BUSY` |
+| **Controller cancels 2.4 s into a 19.9 MB transfer** | **Pass** | display terminal as `cancelled by the sender`; controller shows `0 of 1 sent / cancelled`; **display partials 0, controller spool 0** |
+| Spool cleanup after a successful batch | **Pass** | `spool/` empty |
+| 19.9 MB transfer completes and verifies | **Pass** | `received FILE (19910151B)`, ~7 s |
+| **Save As a 19.9 MB file while interacting** | **Pass** | `/sdcard/Download/sample-app.apk` written at exactly 19,910,151 bytes; no ANR and no fatal exception in logcat; cached source intact; a swipe during the copy was accepted |
+| **A presentation image does not become a received file** | **Pass** | 2.58 MB image: display log `received IMAGE (2582789B)`, landed in `presentation/`, `received/` payload count unchanged, zero `.jpg` in `received/` |
+| Legacy cache migration on a real installation | **Pass** | the Lenovo's pre-existing `ready/` directory was classified at startup: two generic payloads with sidecars moved to `received/` and still listed, `presentation/` empty, `ready/` removed |
+| Image and PDF presentation transfers still work | **Pass** | the image above rendered on the companion (`showing SHOWING_IMAGE`) |
+| Received-file actions and 2x2 grid on API 24 | **Pass** | verified on screen and by the instrumentation suite running on that device |
+| Pairing, discovery, role switching | **Pass** | the S22 was switched display -> controller and re-paired during this session |
+
+**Not run on hardware, and why:**
+
+- ~50 MiB boundary, aggregate batch-size boundary, and a full 20-file batch end to end. The
+  20-file *dialog* is covered by instrumentation on both devices and the limits by unit tests, but
+  no 20-file transfer was performed.
+- Companion rejects the batch, and companion dismisses with Back. The reject path is unit-tested
+  and shares `endBatch` with the cancel path that was verified, but neither was driven on the
+  phones this round.
+- Wi-Fi/hotspot disconnect mid-transfer, force-stop mid-transfer, and reconnect-then-send. The
+  session-end teardown is code-reviewed and shares the same terminal path; **not** exercised.
+- Transferring while screen mirroring is active, and mirroring survival afterwards.
+- Landscape and large-font passes on the Lenovo. The bounded dialog and the action grid were
+  designed for it and are instrumentation-tested at default settings on that device, but no
+  large-font or landscape run was performed.
+- Repeated cancel/send cycles beyond the single cycle verified above.
+- Open and Share on a received file were verified in the previous round on the same code path and
+  were not re-driven here.
+
+### Not covered by unit tests
+
+The controller-side terminal behaviour -- that cancellation sends `FILE_BATCH_CANCEL` before
+cancelling the coroutine -- has **no unit test**. `ContentRouter` needs a live `RelaySession`, which
+is a concrete class over a real `SecureConnection`, so a fake would mean standing up the loopback
+harness. It is verified on hardware instead (three cancellation cases above, including cleanup of
+both the partial and the spool). The receiving half of the same state machine *is* unit-tested in
+full by `AcceptedBatchTest`.
+
 ### Two bugs the device found
 
 Neither was reachable by inspection or by any unit test, and both are the reason this section

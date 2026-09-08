@@ -57,7 +57,13 @@ class ContentCacheRetentionTest {
         )?.also { it.setLastModified(now) }
     }
 
-    private fun payloads() = File(root, "ready").listFiles()
+    /** The generic received-files directory: what `receivedFiles()` reads. */
+    private fun receivedDir() = File(root, ContentCache.RECEIVED_DIR)
+
+    /** Presentation payloads, which must never surface as received files. */
+    private fun presentationDir() = File(root, ContentCache.PRESENTATION_DIR)
+
+    private fun payloads() = receivedDir().listFiles()
         ?.filterNot { it.name.endsWith(".meta") }
         .orEmpty()
 
@@ -114,7 +120,7 @@ class ContentCacheRetentionTest {
     fun `a file whose sidecar is missing is still listed`() {
         val cache = cache()
         store(cache, "orphan.bin")
-        File(root, "ready").listFiles()?.first { it.name.endsWith(".meta") }?.delete()
+        receivedDir().listFiles()?.first { it.name.endsWith(".meta") }?.delete()
         // Losing a label is not a reason to hide a file the user was told they received.
         val received = cache.receivedFiles()
         assertEquals(1, received.size)
@@ -125,7 +131,7 @@ class ContentCacheRetentionTest {
     fun `a sidecar whose recorded size disagrees with the file is ignored`() {
         val cache = cache()
         store(cache, "tampered.pdf", size = 16)
-        val sidecar = File(root, "ready").listFiles()!!.first { it.name.endsWith(".meta") }
+        val sidecar = receivedDir().listFiles()!!.first { it.name.endsWith(".meta") }
         sidecar.writeText("tampered.pdf\napplication/pdf\n999999\n")
         // The file's own length is the fact; the sidecar is a claim. Trusting the claim would let
         // a stale sidecar misreport what is about to be shared.
@@ -136,8 +142,8 @@ class ContentCacheRetentionTest {
     fun `a sidecar cannot smuggle a path through the display name`() {
         val cache = cache()
         store(cache, "ok.pdf")
-        val sidecar = File(root, "ready").listFiles()!!.first { it.name.endsWith(".meta") }
-        val payload = File(root, "ready").listFiles()!!.first { !it.name.endsWith(".meta") }
+        val sidecar = receivedDir().listFiles()!!.first { it.name.endsWith(".meta") }
+        val payload = receivedDir().listFiles()!!.first { !it.name.endsWith(".meta") }
         sidecar.writeText("../../../etc/passwd\ntext/plain\n${payload.length()}\n")
         val name = cache.receivedFiles().single().displayName
         assertFalse("a path survived into the display name: '$name'", name.contains('/'))
@@ -167,7 +173,7 @@ class ContentCacheRetentionTest {
         val kept = cache.receivedFiles().map { it.displayName }
         assertEquals(listOf("newest.pdf", "middle.pdf"), kept)
         // No orphan metadata left describing a file that is gone.
-        val sidecars = File(root, "ready").listFiles()!!.count { it.name.endsWith(".meta") }
+        val sidecars = receivedDir().listFiles()!!.count { it.name.endsWith(".meta") }
         assertEquals(2, sidecars)
     }
 
@@ -190,7 +196,7 @@ class ContentCacheRetentionTest {
         now += FileTransferPolicy.PENDING_EXPIRY_MS + 1
         assertEquals(1, cache.sweepExpired())
         assertEquals(0, payloads().size)
-        assertTrue(File(root, "ready").listFiles()!!.none { it.name.endsWith(".meta") })
+        assertTrue(receivedDir().listFiles()!!.none { it.name.endsWith(".meta") })
     }
 
     @Test
@@ -223,7 +229,7 @@ class ContentCacheRetentionTest {
         val id = UUID.randomUUID()
         store(cache, "gone.pdf", id = id)
         assertTrue(cache.deleteReceived(id))
-        assertEquals(0, File(root, "ready").listFiles()!!.size)
+        assertEquals(0, receivedDir().listFiles()!!.size)
         assertTrue(cache.receivedFiles().isEmpty())
     }
 
@@ -246,17 +252,120 @@ class ContentCacheRetentionTest {
     }
 
     @Test
-    fun `promote without metadata writes no sidecar`() {
-        // Images and PDFs are shown immediately and their labels live in the presentation state.
+    fun `a payload promoted without metadata is a presentation file, not a received file`() {
+        // The P1 separation, at its source. Metadata present means a generic user file; absent
+        // means an image or PDF for the presentation screen. They shared one directory before,
+        // and receivedFiles() listed whatever it found, so an image sent last week reappeared in
+        // "Received files" as a UUID with application/octet-stream.
         val cache = cache()
         val id = UUID.randomUUID()
         val partial = cache.createPartial(id)
         partial.writeBytes(ByteArray(8))
-        cache.promote(partial, id, "jpg")
-        assertTrue(File(root, "ready").listFiles()!!.none { it.name.endsWith(".meta") })
-        assertNull(
-            "a file with no sidecar should not claim a recorded name",
-            cache.receivedFiles().singleOrNull()?.displayName?.takeIf { it.contains("jpeg") },
-        )
+        val promoted = cache.promote(partial, id, "jpg")
+
+        assertNotNull(promoted)
+        assertEquals(presentationDir(), promoted!!.parentFile)
+        assertTrue("a presentation payload must not be a received file", cache.receivedFiles().isEmpty())
+        assertTrue(receivedDir().listFiles()!!.none { it.name.endsWith(".meta") })
+        assertEquals(1, cache.presentationFiles().size)
+    }
+
+    @Test
+    fun `presentation and received payloads do not collide`() {
+        val cache = cache()
+        store(cache, "doc.pdf")
+        val id = UUID.randomUUID()
+        val partial = cache.createPartial(id)
+        partial.writeBytes(ByteArray(4))
+        cache.promote(partial, id, "png")
+
+        assertEquals(1, cache.receivedFiles().size)
+        assertEquals("doc.pdf", cache.receivedFiles().single().displayName)
+        assertEquals(1, cache.presentationFiles().size)
+    }
+
+    // -- legacy migration ---------------------------------------------------------------------
+
+    @Test
+    fun `a legacy generic file with a sidecar migrates and stays listed`() {
+        // An installation that ran the shared-directory layout has both kinds in `ready/`.
+        val legacy = File(root, ContentCache.LEGACY_READY_DIR)
+        legacy.mkdirs()
+        val id = UUID.randomUUID()
+        File(legacy, "$id.pdf").writeBytes(ByteArray(24))
+        File(legacy, "$id.meta").writeText("Quarterly.pdf\napplication/pdf\n24\n")
+
+        val cache = cache()
+        assertEquals(1, cache.migrateLegacyLayout())
+
+        val received = cache.receivedFiles().single()
+        assertEquals("Quarterly.pdf", received.displayName)
+        assertEquals("application/pdf", received.mimeType)
+        assertEquals(receivedDir(), received.file.parentFile)
+    }
+
+    @Test
+    fun `a legacy payload without a sidecar is kept but not listed`() {
+        // Presentation leftovers were the only kind that promoted without metadata. They must not
+        // appear as received files, and must not be deleted either: they are still the user's.
+        val legacy = File(root, ContentCache.LEGACY_READY_DIR)
+        legacy.mkdirs()
+        val id = UUID.randomUUID()
+        File(legacy, "$id.jpg").writeBytes(ByteArray(16))
+
+        val cache = cache()
+        assertEquals(1, cache.migrateLegacyLayout())
+
+        assertTrue(cache.receivedFiles().isEmpty())
+        assertEquals(1, cache.presentationFiles().size)
+    }
+
+    @Test
+    fun `migration is idempotent`() {
+        val legacy = File(root, ContentCache.LEGACY_READY_DIR)
+        legacy.mkdirs()
+        val id = UUID.randomUUID()
+        File(legacy, "$id.pdf").writeBytes(ByteArray(8))
+        File(legacy, "$id.meta").writeText("a.pdf\napplication/pdf\n8\n")
+
+        val cache = cache()
+        assertEquals(1, cache.migrateLegacyLayout())
+        // Second and third passes find nothing and change nothing.
+        assertEquals(0, cache.migrateLegacyLayout())
+        assertEquals(0, cache.migrateLegacyLayout())
+        assertEquals(1, cache.receivedFiles().size)
+    }
+
+    @Test
+    fun `migration with no legacy directory does nothing`() {
+        assertEquals(0, cache().migrateLegacyLayout())
+    }
+
+    @Test
+    fun `a legacy sidecar whose payload is gone is discarded`() {
+        val legacy = File(root, ContentCache.LEGACY_READY_DIR)
+        legacy.mkdirs()
+        File(legacy, "${UUID.randomUUID()}.meta").writeText("orphan.pdf\napplication/pdf\n99\n")
+
+        val cache = cache()
+        cache.migrateLegacyLayout()
+        assertTrue(cache.receivedFiles().isEmpty())
+        assertFalse(legacy.exists())
+    }
+
+    // -- spool ------------------------------------------------------------------------------
+
+    @Test
+    fun `spool files are swept and are not received files`() {
+        val cache = cache()
+        val spooled = cache.spool.fileFor(UUID.randomUUID())
+        spooled.writeBytes(ByteArray(64))
+        assertTrue(spooled.exists())
+
+        // A spool file is an outbound copy of the user's own document. It is neither a received
+        // file nor shareable, and it must not survive a restart.
+        assertTrue(cache.receivedFiles().isEmpty())
+        assertEquals(1, cache.spool.deleteAll())
+        assertFalse(spooled.exists())
     }
 }

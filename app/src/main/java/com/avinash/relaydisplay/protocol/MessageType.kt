@@ -64,6 +64,15 @@ enum class MessageType(val code: Int, val requiresSecureSession: Boolean) {
     /** Display -> Controller: the user rejected it, or it broke a limit. */
     FILE_BATCH_REJECT(0x004B, true),
 
+    /**
+     * Either direction: this batch is terminated.
+     *
+     * The terminal event `file-v1` lacked. Without it a controller-side cancellation was invisible
+     * to the Display, which kept its consent and its partial file and then refused the next batch
+     * as BUSY.
+     */
+    FILE_BATCH_CANCEL(0x004C, true),
+
     // --- mirroring ---
     MIRROR_START(0x0050, true),
     MIRROR_CONFIG(0x0051, true),

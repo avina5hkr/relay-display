@@ -736,7 +736,13 @@ class RelayEngine(
         // The display is the side that receives generic files, so it is the side that announces
         // the capability. A controller checks for this before offering a file batch and tells the
         // user plainly when the peer is too old, rather than streaming a kind it cannot parse.
-        Capabilities.FILE_V1,
+        //
+        // file-v2 only, and file-v1 deliberately not alongside it. v1's manifest bound nothing:
+        // it carried no transfer id and no digest, and the per-file offer carried no batch
+        // identity, so an accepted batch could be followed by different files. Announcing both
+        // would mean either honouring that -- the vulnerability -- or advertising a capability
+        // this build refuses to act on. No release shipped v1, so nothing in the field regresses.
+        Capabilities.FILE_V2,
         Capabilities.MIRROR_RECEIVE,
     )
 

@@ -23,12 +23,24 @@ class FileBatchManifestTest {
     private fun offer(vararg files: FileManifestEntry) = FileBatchOffer(
         id = messageId,
         batchId = batchId,
-        senderName = "Controller",
         files = files.toList(),
     )
 
-    private fun entry(name: String, mime: String = "application/pdf", size: Long = 10L) =
-        FileManifestEntry(name, mime, size)
+    private var nextId = 0
+
+    private fun entry(
+        name: String,
+        mime: String = "application/pdf",
+        size: Long = 10L,
+        transferId: UUID = UUID.nameUUIDFromBytes("entry-${nextId++}".toByteArray()),
+        digest: ByteArray = ByteArray(32) { it.toByte() },
+    ) = FileManifestEntry(
+        transferId = transferId,
+        displayName = name,
+        mimeType = mime,
+        sizeBytes = size,
+        sha256 = digest,
+    )
 
     private fun decodeFails(bytes: ByteArray, why: String) {
         try {
@@ -152,6 +164,31 @@ class FileBatchManifestTest {
         tampered[at - 2] = 0x7F
         tampered[at - 1] = 0xFF.toByte()
         decodeFails(tampered, "declared a name longer than the manifest")
+    }
+
+    @Test
+    fun `a manifest naming the same transfer twice is refused`() {
+        // An entry the receiver cannot tell apart from another is exactly what the binding exists
+        // to prevent, so an ambiguous manifest is refused before it can be shown to anyone.
+        val shared = UUID.fromString("33333333-3333-3333-3333-333333333333")
+        decodeFails(
+            encode(offer(entry("a.pdf", transferId = shared), entry("b.pdf", transferId = shared))),
+            "named the same transfer id twice",
+        )
+    }
+
+    @Test
+    fun `a digest survives the round trip byte for byte`() {
+        val digest = ByteArray(32) { (255 - it).toByte() }
+        val decoded = MessageCodec.decode(encode(offer(entry("x.bin", digest = digest)))) as FileBatchOffer
+        assertTrue(decoded.files[0].sha256.contentEquals(digest))
+    }
+
+    @Test
+    fun `a transfer id survives the round trip`() {
+        val tid = UUID.fromString("44444444-5555-6666-7777-888888888888")
+        val decoded = MessageCodec.decode(encode(offer(entry("x.bin", transferId = tid)))) as FileBatchOffer
+        assertEquals(tid, decoded.files[0].transferId)
     }
 
     @Test

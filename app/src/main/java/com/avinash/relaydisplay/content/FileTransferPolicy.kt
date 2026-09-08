@@ -76,6 +76,16 @@ object FileTransferPolicy {
     const val PENDING_EXPIRY_MS = 24L * 60L * 60L * 1000L
 
     /**
+     * How long an unanswered consent prompt survives on the receiving phone.
+     *
+     * Longer than the sender's own decision timeout on purpose, so in the normal case the sender
+     * gives up first and says so. This is the backstop for when that message never arrives -- a
+     * lost cancel, a force-stopped controller, a dropped link -- because a prompt that can never
+     * be answered would block every later batch as BUSY for the life of the session.
+     */
+    const val CONSENT_EXPIRY_MS = 150_000L
+
+    /**
      * Whether the retention budget can actually hold one whole valid batch.
      *
      * A guard against someone tuning one number without the other. Checked by a unit test rather

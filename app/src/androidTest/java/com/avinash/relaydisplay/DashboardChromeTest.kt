@@ -75,7 +75,10 @@ class DashboardChromeTest {
         launchAs(DeviceRole.CONTROLLER)
         compose.onNodeWithTag("open_settings").performClick()
         compose.waitUntil(TIMEOUT_MS) { compose.hasNodeWithTag("settings_change_role") }
-        compose.onNodeWithTag("settings_change_role").assertIsDisplayed()
+        // Settings is a scrolling column, so this control is below the fold in landscape or at a
+        // large font scale. It is present and reachable -- assertIsDisplayed asks about actual
+        // visibility, so the test has to scroll to it the way a user would.
+        compose.onNodeWithTag("settings_change_role").performScrollTo().assertIsDisplayed()
     }
 
     @Test

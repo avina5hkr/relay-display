@@ -168,41 +168,79 @@ Generic file transfer widens what a peer can send from "an image or a PDF" to "a
 name and any declared type". The peer is authenticated, not trusted: pairing proves which phone is
 talking, never that the software on it is behaving.
 
-### Consent, not just pairing
+### Consent, not just pairing, and bound to specific files
 
-**A generic file is never written without a person agreeing to it.** The controller sends a
-`FILE_BATCH_OFFER` naming the sender, the file count, and every name and size; the receiving phone
-shows that as a modal prompt; nothing is opened or written until the user accepts. A
-`CONTENT_OFFER` with `kind = FILE` that arrives without an accepted batch behind it is refused with
-`PERMISSION_DENIED`.
+**A generic file is never written without a person agreeing to it, and the agreement names exact
+files.** The controller sends a `FILE_BATCH_OFFER` whose manifest carries, per file, a
+pre-allocated transfer id, the sanitised name, the normalised type, the exact measured size and the
+SHA-256 of the bytes that will be sent. The receiving phone shows that as a modal prompt. Nothing
+is opened or written until the user accepts, and after they accept every incoming `CONTENT_OFFER`
+is matched against the approved entry before a partial file exists. Mismatches are refused; see
+`docs/PROTOCOL.md` for the full check list.
 
-This exists because pairing answers a different question. Pairing establishes which phone is on the
-other end — it says nothing about whether the software on it is behaving, or whether its user meant
-to push twenty files at this phone right now. Images and PDFs are a presentation the user is
-already watching; arbitrary files landing in storage are not.
+This replaced a real vulnerability rather than hardening a merely theoretical one. In `file-v1` the
+gate was a single `batchAccepted` boolean: the manifest identified no transfer and pinned no
+content, and the per-file offer named no batch, so there was nothing to compare an arriving file
+against. A buggy or modified controller could display one manifest and send entirely different
+files, within the per-file limits, and the user would have approved something they never saw. An
+`acceptedBatchId` field existed but was assigned and never read.
 
-The consent is scoped in three ways:
+Pairing answers a different question. It establishes which phone is on the other end; it says
+nothing about whether the software on it is behaving, or whether its user meant to push twenty
+files at this phone right now. Images and PDFs are a presentation the user is already watching;
+arbitrary files landing in storage are not.
 
-- **Per batch.** One acceptance covers the files that batch declared and no more. Once that many
-  files have arrived, the acceptance is spent and the next batch asks again.
-- **Per session.** It is discarded whenever the session ends, so it can never outlive the
+The consent is scoped in five ways:
+
+- **Per file.** Each manifest entry can be consumed exactly once. A replay of a completed file, a
+  second offer of one in flight, and a file that already failed are all refused.
+- **Per batch.** An offer naming a different batch id is refused, and no unlisted file is ever
+  accepted, so the count cannot be exceeded.
+- **Per session.** Consent is discarded whenever the session ends, so it can never outlive the
   connection it was given on.
 - **One at a time.** A second offer arriving while one is pending, or while a transfer is running,
-  is refused with `BUSY` rather than queued behind the first.
+  is refused with `BUSY` rather than queued.
+- **In time.** An unanswered prompt expires locally, so a lost cancellation cannot leave a
+  permanent dialog and permanently block the feature.
 
-Dismissing the prompt — back, or a tap outside it — is a rejection, not a deferral. The
-alternative leaves the sender waiting on an answer that will never arrive.
-
-There is **no auto-accept setting**, and the prompt cannot be disabled. See
+Dismissing the prompt (back, or a tap outside it) is a rejection, not a deferral, and the sender is
+told. There is **no auto-accept setting**, and the prompt cannot be disabled; see
 `docs/IMPLEMENTATION_STATUS.md` for why that omission is deliberate.
 
-### Sizes are measured before they are trusted
+**The peer's identity in the dialog comes from the handshake, not from the message.** `file-v1`
+carried a `senderName` string inside the offer and displayed it, so the name the user read while
+deciding was composed by the peer. That field was removed from the protocol.
 
-The sender streams each file once before offering it, counting bytes and computing the SHA-256 the
-offer must carry anyway, so the size the receiver is shown and validates against is the real length
-of the bytes that will arrive. No "unknown size" value travels, and any negative size on the wire
-is a malformed frame. The bound is enforced *during* that pass, so a provider that under-reports
-its own length cannot make the sender read an unbounded amount.
+**Refusal reasons never carry peer content.** A rejection is logged as the rule that was broken --
+"digest differs from the accepted entry" -- and never the filename, type, size or digest that broke
+it, because those reasons reach a diagnostic log the user may share. `AcceptedBatchTest` asserts
+that no refusal reason contains a filename or a digit.
+
+### Sizes are measured before they are trusted### Sizes are measured before they are trusted, from bytes that cannot change
+
+The sender **spools** each picked file into app-private storage once, counting bytes and computing
+the SHA-256 as it copies, and then transmits the spooled copy. The size and digest in the manifest
+therefore describe exactly the bytes that will be sent. No "unknown size" value travels, and any
+negative size on the wire is a malformed frame. The limit is enforced *during* the copy, so a
+provider that under-reports its own length cannot make the sender write an unbounded amount.
+
+Spooling replaced reading the source twice -- once to measure and digest, once to transmit. A
+`ContentResolver` gives no guarantee that two reads agree: a provider may hand back a one-shot
+stream, regenerate different bytes, or be gone the second time. In the worst case the second read
+would have sent content that no longer matched what the user was shown and the receiver had
+approved, which is precisely the property the manifest binding exists to guarantee.
+
+This applies to **generic files only**. The image and PDF presentation path still measures and
+then reopens its source; that was left unchanged rather than migrated in the same change. The
+exposure there is smaller: those transfers carry no approved manifest to disagree with, so a
+changed stream fails the receiver's digest check and surfaces as a failed transfer rather than as
+content the user did not approve.
+
+Spool files are app-private, are **not** exposed through the FileProvider, are deleted on every
+terminal path (completion, rejection, cancellation, timeout, failure, disconnect), and are swept at
+startup so a batch interrupted by process death does not leave a copy of the user's document
+behind. No URI permission is persisted: the grant from the picker is used during preparation and
+never needed again.
 
 ### Malicious filenames
 
@@ -269,6 +307,14 @@ files — and not the whole cache, not external storage, and **not** the `incomi
 directory. A provider rooted at `.` would turn any traversal that got past the sanitiser into a
 readable URI for arbitrary app-private data.
 
+Three sibling directories are deliberately outside it. `incoming/` holds partials, which have not
+passed their hash check, so their bytes are whatever the peer sent. `presentation/` holds images
+and PDFs shown on screen, which the user never asked to keep or share. `spool/` holds outbound
+copies of the user's own documents. Splitting generic received files into their own directory is
+also what makes the received-files list trustworthy: a file there *is* a received file, whether or
+not its metadata sidecar survived, rather than being inferred from whatever happened to be in a
+shared directory.
+
 `incoming/` was removed from that file rather than kept for a hypothetical resume. A partial has
 not passed its hash check, so its bytes are whatever the peer sent; granting a URI to one would
 hand another app a half-written file that failed integrity checking. Nothing in the app needs to
@@ -280,6 +326,13 @@ The declared path must include the cache's own container directory (`relay_cache
 call threw and took the app down — a crash rather than a leak, but it also meant the narrowing had
 never actually been exercised. `FileProviderPathTest` now asserts on a device that a file the cache
 wrote can be shared, that a partial cannot, and that the cache root is not exposed.
+
+**Saving out runs off the main thread.** The copy used to happen inside the picker's result
+callback, which is the main thread, for files up to 50 MiB: seconds of frozen UI on the older phone
+and a plausible ANR. It now runs on an IO dispatcher with observable state, streams through a fixed
+buffer rather than reading the file into memory, closes both streams on every path, refuses to
+report success for a short write, and asks the caller to remove a partially written destination so
+the user is not left with a truncated file that claims to have saved.
 
 Opening is always through `Intent.createChooser`, so the handler is the user's choice every time
 rather than a default set once, and `ACTION_INSTALL_PACKAGE` is never used. Verified on hardware:

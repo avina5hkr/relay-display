@@ -36,6 +36,7 @@ import com.avinash.relaydisplay.ui.settings.AboutScreen
 import com.avinash.relaydisplay.ui.settings.DiagnosticsScreen
 import com.avinash.relaydisplay.ui.settings.SettingsScreen
 import kotlinx.coroutines.launch
+import com.avinash.relaydisplay.ui.display.IncomingBatchDialog
 
 /** What arrived through an ACTION_SEND intent, after validation. */
 data class SharedPayload(val text: String?)
@@ -91,6 +92,27 @@ fun RelayAppRoot(
     val shouldPresent = role == DeviceRole.DISPLAY &&
         presentation.content != PresentedContent.Waiting &&
         navigator.current == Screen.DisplayHome
+
+    // Hosted here, above the full-screen presentation branch below, so the prompt composes
+    // whatever the display is showing.
+    //
+    // It used to live inside DisplayHomeScreen, which is only the *dashboard*. When the companion
+    // is showing content or a mirror this function returns early into PresentationSurface, so a
+    // batch offered during mirroring raised a prompt that was never composed: the sender waited
+    // out its timeout and the feature was simply unusable while mirroring. Found by transferring
+    // a file with a mirror running on the two phones. Nothing was left stuck -- the sender's
+    // timeout and the receiver's local expiry both fire -- but the transfer could not be accepted.
+    //
+    // An AlertDialog gets its own window, so it draws over the presentation surface rather than
+    // being clipped by it.
+    val incomingBatch by container.contentRouter.incomingBatch.collectAsStateWithLifecycle()
+    incomingBatch?.let { batch ->
+        IncomingBatchDialog(
+            batch = batch,
+            onAccept = { container.contentRouter.acceptIncomingBatch() },
+            onReject = { container.contentRouter.rejectIncomingBatch() },
+        )
+    }
 
     if (shouldPresent) {
         PresentationSurface(

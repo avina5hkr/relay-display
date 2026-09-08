@@ -36,7 +36,7 @@ class FileProviderPathTest {
     private val authority: String get() = "${context.packageName}.fileprovider"
 
     private val readyDir: File
-        get() = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), "ready")
+        get() = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), ContentCache.RECEIVED_DIR)
 
     private val written = mutableListOf<File>()
 
@@ -60,9 +60,9 @@ class FileProviderPathTest {
             FileProvider.getUriForFile(context, authority, file)
         } catch (e: IllegalArgumentException) {
             fail(
-                "file_provider_paths.xml does not cover the cache's ready directory. " +
-                    "It must be \"${ContentCache.DIRECTORY_NAME}/ready/\" under cache-path. " +
-                    "Underlying error: ${e.message}",
+                "file_provider_paths.xml does not cover the cache's received-files directory. " +
+                    "It must be \"${ContentCache.DIRECTORY_NAME}/${ContentCache.RECEIVED_DIR}/\" " +
+                    "under cache-path. Underlying error: ${e.message}",
             )
             return
         }
@@ -87,7 +87,7 @@ class FileProviderPathTest {
     fun aPartialIsNotExposedThroughTheProvider() {
         // incoming/ is deliberately absent from the declared paths: a partial has not passed its
         // hash check, so its bytes are whatever the peer sent.
-        val incoming = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), "incoming")
+        val incoming = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), ContentCache.INCOMING_DIR)
         incoming.mkdirs()
         val partial = File(incoming, "${UUID.randomUUID()}.part")
         partial.writeBytes(ByteArray(8))
@@ -97,6 +97,40 @@ class FileProviderPathTest {
             fail("a partial must not be shareable, but got $uri")
         } catch (e: IllegalArgumentException) {
             // Correct: no configured root contains incoming/.
+        }
+    }
+
+    @Test
+    fun aPresentationPayloadIsNotExposedThroughTheProvider() {
+        // Images and PDFs shown on screen are not the received-files feature, and the user never
+        // asked to keep or share them.
+        val dir = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), ContentCache.PRESENTATION_DIR)
+        dir.mkdirs()
+        val payload = File(dir, "${UUID.randomUUID()}.jpg")
+        payload.writeBytes(ByteArray(8))
+        written += payload
+        try {
+            val uri = FileProvider.getUriForFile(context, authority, payload)
+            fail("a presentation payload must not be shareable, but got $uri")
+        } catch (e: IllegalArgumentException) {
+            // Correct.
+        }
+    }
+
+    @Test
+    fun anOutboundSpoolFileIsNotExposedThroughTheProvider() {
+        // Spool files are copies of the user's own documents waiting to be sent. Nothing outside
+        // this process has any reason to read one.
+        val dir = File(File(context.cacheDir, ContentCache.DIRECTORY_NAME), "spool")
+        dir.mkdirs()
+        val spooled = File(dir, "${UUID.randomUUID()}.spool")
+        spooled.writeBytes(ByteArray(8))
+        written += spooled
+        try {
+            val uri = FileProvider.getUriForFile(context, authority, spooled)
+            fail("a spool file must not be shareable, but got $uri")
+        } catch (e: IllegalArgumentException) {
+            // Correct.
         }
     }
 

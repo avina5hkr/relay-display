@@ -146,15 +146,25 @@ object MessageCodec {
                 w.putString(4, m.mimeType)
                 w.putString(5, m.displayName)
                 w.putBytes(6, m.sha256)
+                // Tags 7 and 8 are written only for a batched generic file. Absent for image and
+                // PDF presentation transfers, which have no batch to bind to -- which is also why
+                // adding them did not change the encoding of any existing message.
+                m.batchId?.let { w.putBytes(7, uuidToBytes(it)) }
+                m.manifestIndex?.let { w.putU8(8, it) }
             }
             is FileBatchOffer -> {
                 w.putBytes(1, uuidToBytes(m.batchId))
-                w.putString(2, m.senderName)
+                // Tag 2 was the sender's name in file-v1 and is deliberately unused: the consent
+                // dialog takes the peer's identity from the authenticated session instead.
                 w.putU8(3, m.files.size)
                 w.putBytes(4, encodeManifest(m.files))
             }
             is FileBatchAccept -> w.putBytes(1, uuidToBytes(m.batchId))
             is FileBatchReject -> {
+                w.putBytes(1, uuidToBytes(m.batchId))
+                w.putU16(2, m.errorCode.code)
+            }
+            is FileBatchCancel -> {
                 w.putBytes(1, uuidToBytes(m.batchId))
                 w.putU16(2, m.errorCode.code)
             }
@@ -307,16 +317,25 @@ object MessageCodec {
                 ?: protocolError(ProtocolErrorCode.UNKNOWN_MESSAGE_TYPE, "unknown present command"),
             intArg = t.u16(2) - 128,
         )
-        MessageType.CONTENT_OFFER -> ContentOffer(
-            id = id,
-            transferId = uuidFromBytes(t.bytes(1, 16), 0),
-            kind = ContentKind.fromWire(t.u8(2))
-                ?: protocolError(ProtocolErrorCode.UNSUPPORTED_FORMAT, "unknown content kind"),
-            sizeBytes = t.i64(3),
-            mimeType = t.string(4, ContentLimits.MAX_MIME_BYTES),
-            displayName = t.string(5, ContentLimits.MAX_FILENAME_BYTES),
-            sha256 = exactly(t.bytes(6, SHA256_BYTES), SHA256_BYTES, "sha256"),
-        )
+        MessageType.CONTENT_OFFER -> {
+            val manifestIndex = t.optU8(8)
+            if (manifestIndex != null && manifestIndex >= ContentLimits.MAX_FILES_PER_BATCH) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "manifest index out of range")
+            }
+            ContentOffer(
+                id = id,
+                transferId = uuidFromBytes(t.bytes(1, 16), 0),
+                kind = ContentKind.fromWire(t.u8(2))
+                    ?: protocolError(ProtocolErrorCode.UNSUPPORTED_FORMAT, "unknown content kind"),
+                sizeBytes = t.i64(3),
+                mimeType = t.string(4, ContentLimits.MAX_MIME_BYTES),
+                displayName = t.string(5, ContentLimits.MAX_FILENAME_BYTES),
+                sha256 = exactly(t.bytes(6, SHA256_BYTES), SHA256_BYTES, "sha256"),
+                // Optional: present for a batched generic file, absent for image and PDF.
+                batchId = t.optBytes(7, 16)?.let { uuidFromBytes(exactly(it, 16, "batchId"), 0) },
+                manifestIndex = manifestIndex,
+            )
+        }
         MessageType.FILE_BATCH_OFFER -> {
             val declaredCount = t.u8(3)
             if (declaredCount < 1 || declaredCount > ContentLimits.MAX_FILES_PER_BATCH) {
@@ -326,12 +345,16 @@ object MessageCodec {
             FileBatchOffer(
                 id = id,
                 batchId = uuidFromBytes(t.bytes(1, 16), 0),
-                senderName = t.string(2, ContentLimits.MAX_DEVICE_NAME_BYTES),
                 files = files,
             )
         }
         MessageType.FILE_BATCH_ACCEPT -> FileBatchAccept(id, uuidFromBytes(t.bytes(1, 16), 0))
         MessageType.FILE_BATCH_REJECT -> FileBatchReject(
+            id = id,
+            batchId = uuidFromBytes(t.bytes(1, 16), 0),
+            errorCode = ProtocolErrorCode.fromCode(t.u16(2)),
+        )
+        MessageType.FILE_BATCH_CANCEL -> FileBatchCancel(
             id = id,
             batchId = uuidFromBytes(t.bytes(1, 16), 0),
             errorCode = ProtocolErrorCode.fromCode(t.u16(2)),
@@ -504,18 +527,19 @@ object MessageCodec {
      */
     private val MAX_MANIFEST_BYTES: Int =
         ContentLimits.MAX_FILES_PER_BATCH *
-            (2 + ContentLimits.MAX_FILENAME_BYTES + 2 + ContentLimits.MAX_MIME_BYTES + 8)
+            (16 + 2 + ContentLimits.MAX_FILENAME_BYTES + 2 + ContentLimits.MAX_MIME_BYTES + 8 + SHA256_BYTES)
 
     /**
      * Packs the file list into one TLV field.
      *
      * The TLV layer keys fields by tag in a map, so it has no repeated fields and a list needs a
-     * nested encoding. Each entry is `u16 nameLen | name | u16 mimeLen | mime | i64 size`, in the
-     * order the files will be sent -- that order is part of the meaning, because the receiver's
-     * "3 of 7" counts against it.
+     * nested encoding. Each entry is
+     * `transferId:16 | u16 nameLen | name | u16 mimeLen | mime | i64 size | sha256:32`,
+     * in the order the files will be sent -- that order is part of the meaning, because the
+     * receiver's "3 of 7" counts against it and the per-file offer restates it as a manifest index.
      */
     private fun encodeManifest(files: List<FileManifestEntry>): ByteArray {
-        val out = java.io.ByteArrayOutputStream(files.size * 96)
+        val out = java.io.ByteArrayOutputStream(files.size * 160)
         for (file in files) {
             val name = file.displayName.toByteArray(StandardCharsets.UTF_8)
             val mime = file.mimeType.toByteArray(StandardCharsets.UTF_8)
@@ -523,6 +547,8 @@ object MessageCodec {
             // this side, not a malformed peer frame.
             require(name.size <= ContentLimits.MAX_FILENAME_BYTES) { "name too long to encode" }
             require(mime.size <= ContentLimits.MAX_MIME_BYTES) { "mime too long to encode" }
+            require(file.sha256.size == SHA256_BYTES) { "digest must be $SHA256_BYTES bytes" }
+            out.write(uuidToBytes(file.transferId))
             out.write((name.size ushr 8) and 0xFF)
             out.write(name.size and 0xFF)
             out.write(name)
@@ -532,6 +558,7 @@ object MessageCodec {
             for (shift in 56 downTo 0 step 8) {
                 out.write(((file.sizeBytes ushr shift) and 0xFF).toInt())
             }
+            out.write(file.sha256)
         }
         return out.toByteArray()
     }
@@ -573,7 +600,17 @@ object MessageCodec {
             return text
         }
 
+        val seenIds = HashSet<java.util.UUID>(expectedCount)
         repeat(expectedCount) {
+            need(16)
+            val transferId = uuidFromBytes(raw.copyOfRange(offset, offset + 16), 0)
+            offset += 16
+            // A manifest that names the same transfer twice cannot be matched unambiguously, and
+            // an entry the receiver cannot tell apart from another is exactly what the binding is
+            // for. Refused here so nothing downstream has to defend against a duplicate key.
+            if (!seenIds.add(transferId)) {
+                protocolError(ProtocolErrorCode.MALFORMED_FRAME, "duplicate transfer id in manifest")
+            }
             val name = readText(ContentLimits.MAX_FILENAME_BYTES, "name")
             val mime = readText(ContentLimits.MAX_MIME_BYTES, "mime type")
             need(8)
@@ -587,7 +624,18 @@ object MessageCodec {
             if (size < 0 || size > ContentLimits.MAX_FILE_BYTES) {
                 protocolError(ProtocolErrorCode.MALFORMED_FRAME, "batch entry size out of range")
             }
-            files.add(FileManifestEntry(displayName = name, mimeType = mime, sizeBytes = size))
+            need(SHA256_BYTES)
+            val digest = raw.copyOfRange(offset, offset + SHA256_BYTES)
+            offset += SHA256_BYTES
+            files.add(
+                FileManifestEntry(
+                    transferId = transferId,
+                    displayName = name,
+                    mimeType = mime,
+                    sizeBytes = size,
+                    sha256 = digest,
+                ),
+            )
         }
         if (offset != raw.size) {
             protocolError(ProtocolErrorCode.MALFORMED_FRAME, "trailing bytes in batch manifest")
@@ -612,6 +660,22 @@ object Capabilities {
      * Relay Display" instead of streaming a format the receiver will mis-parse.
      */
     const val FILE_V1 = "file-v1"
+
+    /**
+     * Generic file transfer, wire version 2. The only version this build offers.
+     *
+     * v2 exists because v1 was not safe: its manifest carried no transfer id and no digest, and
+     * the per-file offer carried no batch identity, so an accepted batch could be followed by
+     * entirely different files. That is a protocol-shaped hole, not something a receiver could
+     * patch around, so the fix is a new version rather than stricter checks on the old one.
+     *
+     * This build advertises **only** `file-v2`. Advertising both would mean either honouring v1's
+     * unbound offers -- the vulnerability -- or accepting a capability it refuses to act on. A
+     * peer that announces only [FILE_V1] is therefore treated as too old and told so, which is
+     * the same path an unversioned peer already took. No release has shipped v1, so nothing in
+     * the field is broken by this.
+     */
+    const val FILE_V2 = "file-v2"
     const val MIRROR_RECEIVE = "mirror-rx"
     const val MIRROR_SEND = "mirror-tx"
 }

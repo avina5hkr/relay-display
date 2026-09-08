@@ -28,6 +28,7 @@ import com.avinash.relaydisplay.ui.common.VerticalGap
 import com.avinash.relaydisplay.ui.controller.modeLabel
 import com.avinash.relaydisplay.platform.RelayPurpose
 import com.avinash.relaydisplay.ui.relayViewModel
+import androidx.compose.ui.platform.LocalContext
 
 /**
  * The waiting screen on the companion phone.
@@ -36,24 +37,29 @@ import com.avinash.relaydisplay.ui.relayViewModel
  * once and then costs nothing, because this phone is slow and is expected to sit on this screen
  * for long stretches.
  */
+/**
+ * Builds the view model with the resolver it needs for Save As.
+ *
+ * A helper rather than an inline default because `relayViewModel`'s factory lambda runs outside
+ * composition, so `LocalContext` has to be read before it and captured.
+ */
+@Composable
+private fun displayViewModel(): DisplayViewModel {
+    val resolver = LocalContext.current.contentResolver
+    return relayViewModel { DisplayViewModel.create(it, resolver) }
+}
+
 @Composable
 fun DisplayHomeScreen(
     onOpenSettings: () -> Unit,
     onOpenPairing: () -> Unit,
     modifier: Modifier = Modifier,
-    viewModel: DisplayViewModel = relayViewModel { DisplayViewModel.create(it) },
+    viewModel: DisplayViewModel = displayViewModel(),
 ) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
 
-    // Modal, and outside the scrolling content: an offer waiting on an answer must not be
-    // something the user can scroll away from without answering.
-    ui.incomingBatch?.let { batch ->
-        IncomingBatchDialog(
-            batch = batch,
-            onAccept = viewModel::acceptIncomingBatch,
-            onReject = viewModel::rejectIncomingBatch,
-        )
-    }
+    // The consent prompt is hosted by RelayAppRoot, not here: this screen is only the dashboard,
+    // and the prompt has to appear over a presentation or a mirror too.
 
     Column(modifier.fillMaxSize()) {
         // Pinned: settings is reachable without scrolling the page.
@@ -121,6 +127,9 @@ fun DisplayHomeScreen(
         ReceivedFilesSection(
             files = ui.receivedFiles,
             onDelete = viewModel::deleteReceivedFile,
+            onSave = viewModel::saveReceivedFile,
+            saveState = ui.saveState,
+            onDismissSaveMessage = viewModel::clearSaveState,
         )
 
         SectionHeader("Network")

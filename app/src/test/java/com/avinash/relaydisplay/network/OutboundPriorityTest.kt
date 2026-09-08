@@ -18,6 +18,7 @@ import com.avinash.relaydisplay.protocol.PresentationStateMessage
 import com.avinash.relaydisplay.protocol.ProtocolErrorCode
 import com.avinash.relaydisplay.protocol.ShowText
 import com.avinash.relaydisplay.protocol.FileBatchAccept
+import com.avinash.relaydisplay.protocol.FileBatchCancel
 import com.avinash.relaydisplay.protocol.FileBatchOffer
 import com.avinash.relaydisplay.protocol.FileBatchReject
 import com.avinash.relaydisplay.protocol.FileManifestEntry
@@ -137,12 +138,29 @@ class OutboundPriorityTest {
         // These three gate everything after them; a batch decision must not wait behind file bytes.
         assertEquals(
             TrafficClass.CONTROL,
-            FileBatchOffer(id(), id(), "phone", listOf(FileManifestEntry("a.pdf", "application/pdf", 1))).trafficClass(),
+            FileBatchOffer(
+                id(),
+                id(),
+                listOf(
+                    FileManifestEntry(
+                        transferId = id(),
+                        displayName = "a.pdf",
+                        mimeType = "application/pdf",
+                        sizeBytes = 1,
+                        sha256 = ByteArray(32),
+                    ),
+                ),
+            ).trafficClass(),
         )
         assertEquals(TrafficClass.CONTROL, FileBatchAccept(id(), id()).trafficClass())
         assertEquals(
             TrafficClass.CONTROL,
             FileBatchReject(id(), id(), ProtocolErrorCode.PERMISSION_DENIED).trafficClass(),
+        )
+        // A batch cancel must overtake the backlog it is abandoning, exactly like TransferCancel.
+        assertEquals(
+            TrafficClass.CONTROL,
+            FileBatchCancel(id(), id(), ProtocolErrorCode.CANCELLED).trafficClass(),
         )
     }
 

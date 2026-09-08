@@ -355,13 +355,31 @@ class ContentCacheTest {
 
     @Test
     fun `clear empties everything`() {
+        // Both destinations, since promotion now routes by purpose: metadata means a generic
+        // received file, no metadata means a presentation payload.
         val cache = ContentCache(temp.newFolder("c4"))
-        val id = UUID.randomUUID()
-        val partial = cache.createPartial(id)
+        val presentationId = UUID.randomUUID()
+        cache.createPartial(presentationId).writeBytes(ByteArray(4))
+        cache.promote(
+            File(temp.root, "c4/${ContentCache.INCOMING_DIR}/$presentationId.part"),
+            presentationId,
+            "bin",
+        )
+
+        val receivedId = UUID.randomUUID()
+        val partial = cache.createPartial(receivedId)
         partial.writeBytes(ByteArray(4))
-        cache.promote(partial, id, "bin")
+        cache.promote(
+            partial,
+            receivedId,
+            "bin",
+            ContentCache.PromotedMetadata("thing.bin", "application/octet-stream"),
+        )
+
         assertTrue(cache.readyFiles().isNotEmpty())
+        assertTrue(cache.presentationFiles().isNotEmpty())
         cache.clear()
         assertTrue(cache.readyFiles().isEmpty())
+        assertTrue(cache.presentationFiles().isEmpty())
     }
 }

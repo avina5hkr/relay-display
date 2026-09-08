@@ -15,6 +15,7 @@ import com.avinash.relaydisplay.network.session.RelaySession
 import com.avinash.relaydisplay.protocol.Ack
 import com.avinash.relaydisplay.protocol.Capabilities
 import com.avinash.relaydisplay.protocol.FileBatchAccept
+import com.avinash.relaydisplay.protocol.FileBatchCancel
 import com.avinash.relaydisplay.protocol.FileBatchOffer
 import com.avinash.relaydisplay.protocol.FileBatchReject
 import com.avinash.relaydisplay.protocol.FileManifestEntry
@@ -97,6 +98,11 @@ class ContentRouter(
     private val pdfPageCounter: (java.io.File) -> Int = { 1 },
     private val mirrorController: MirrorController? = null,
     private val remote: RemotePresentationTracker = RemotePresentationTracker(),
+    /**
+     * How long an unanswered consent prompt survives here. Injected so a test can exercise the
+     * expiry path without waiting out the real two and a half minutes.
+     */
+    private val consentExpiryMs: Long = FileTransferPolicy.CONSENT_EXPIRY_MS,
 ) {
     /** What the Controller believes the Display is showing. Observed by the controller UI. */
     val remotePresentation: StateFlow<RemotePresentationState> = remote.state
@@ -130,10 +136,19 @@ class ContentRouter(
 
         // Off the main thread: this runs during application startup and touches the filesystem.
         scope.launch(Dispatchers.IO) {
+            // Before any sweep: a legacy payload must be classified before expiry or eviction
+            // can consider it, or a received file could be evicted as if it were unlabelled.
+            val migrated = cache.migrateLegacyLayout()
+            if (migrated > 0) diagnostics.info("router", "migrated $migrated cached file(s)")
             cache.sweepPartials()
             // Enforces FileTransferPolicy.PENDING_EXPIRY_MS. Same pass, same dispatcher: both are
             // directory scans and neither belongs on the main thread.
             cache.sweepExpired()
+            // Outbound spool copies from a batch the process did not live to finish. Each one is
+            // a full copy of one of the user's own documents, so leaving them is both a waste of
+            // space and more of the user's data at rest than the feature needs.
+            val spooled = cache.spool.deleteAll()
+            if (spooled > 0) diagnostics.info("router", "swept $spooled spooled file(s) at startup")
         }
 
         // Bind presentation identity to the live session. Every session gets a fresh id, so a
@@ -148,7 +163,11 @@ class ContentRouter(
                     // Consent does not outlive the connection it was given on, and a prompt for a
                     // peer that has gone away must not stay on screen offering to accept.
                     _incomingBatch.value = null
-                    clearBatchAcceptance()
+                    // One terminal path, so a disconnect leaves exactly the same clean state as
+                    // a cancellation: no consent, no dialog, no partial, nothing pending.
+                    (pendingOffer?.batchId ?: accepted?.batchId)?.let {
+                        endBatch(it, outcome = "the connection ended", notify = null)
+                    }
                     // A partial from a dead session can never be completed: its sender is gone and
                     // the protocol has no resume. Delete it now rather than waiting for expiry.
                     abortInboundQuietly("the connection ended")
@@ -156,7 +175,7 @@ class ContentRouter(
                     // disconnect, a role switch or the user pressing Stop keeps its last phase
                     // forever, so the Send screen shows "sending 3 of 7" against a connection
                     // that no longer exists and the progress bar never moves again.
-                    failBatchOnSessionEnd()
+                    failOutboundBatchOnSessionEnd()
                     diagnostics.info("RD/Session", "session ended")
                     return@collect
                 }
@@ -237,6 +256,7 @@ class ContentRouter(
             }
 
             is FileBatchOffer -> onBatchOffer(session, message)
+            is FileBatchCancel -> onBatchCancel(message)
             is ContentOffer -> onOffer(session, message)
             is TransferStart -> onTransferStart(session, message)
             is TransferChunk -> onChunk(session, message)
@@ -363,17 +383,39 @@ class ContentRouter(
             session.trySend(ContentReject(UUID.randomUUID(), offer.transferId, ProtocolErrorCode.BUSY))
             return
         }
-        // A generic file needs the user's consent, and that consent is given once for a whole
-        // batch. Without an accepted batch behind it there is nothing to consent to, so the offer
-        // is refused rather than written to disk: this is what stops a paired-but-misbehaving peer
-        // pushing files onto the phone with no interaction at all. Images and PDFs are unaffected;
-        // they are a presentation the user is already watching.
-        if (offer.kind == ContentKind.FILE && !batchAccepted) {
-            diagnostics.info("router", "file offer without an accepted batch refused")
-            session.trySend(
-                ContentReject(UUID.randomUUID(), offer.transferId, ProtocolErrorCode.PERMISSION_DENIED),
-            )
-            return
+        // A generic file needs the user's consent, and consent is for *specific files*. Matching
+        // the offer against the accepted manifest is the whole point: file-v1 checked only that
+        // some batch had been accepted, so a controller could display one manifest and then send
+        // anything. Images and PDFs are unaffected -- they are a presentation the user is already
+        // watching, not bytes landing in storage.
+        //
+        // Refused before TransferReceiver exists, so no partial file is ever created for a file
+        // that was not approved.
+        if (offer.kind == ContentKind.FILE) {
+            val batch = accepted
+            if (batch == null) {
+                diagnostics.info("router", "file offer with no accepted batch refused")
+                session.trySend(
+                    ContentReject(UUID.randomUUID(), offer.transferId, ProtocolErrorCode.PERMISSION_DENIED),
+                )
+                return
+            }
+            when (val verdict = batch.match(offer)) {
+                is AcceptedBatch.OfferVerdict.Refused -> {
+                    // The reason is deliberately free of peer content: no name, type, size or
+                    // digest reaches the log.
+                    diagnostics.warn("router", "file offer refused: ${verdict.reason}")
+                    session.trySend(ContentReject(UUID.randomUUID(), offer.transferId, verdict.code))
+                    return
+                }
+                is AcceptedBatch.OfferVerdict.Accepted -> {
+                    batch.markReceiving(offer.transferId)
+                    diagnostics.debug(
+                        "router",
+                        "file ${verdict.index + 1} of ${batch.size} matched the accepted manifest",
+                    )
+                }
+            }
         }
         val receiver = TransferReceiver(cache)
         when (val outcome = receiver.evaluate(offer)) {
@@ -500,19 +542,27 @@ class ContentRouter(
     val receivedFiles: StateFlow<List<ReceivedFile>> = _receivedFiles.asStateFlow()
 
     /**
-     * Whether a batch offer has been accepted and its files may now be received.
+     * Consent, as the manifest the user approved rather than a boolean.
      *
-     * A single flag rather than a set of batch ids because the protocol allows one transfer at a
-     * time: there is never a second accepted batch to keep track of. Cleared when the batch
-     * settles, when the user rejects, and whenever the session ends, so consent never outlives
-     * the connection it was given on.
+     * The previous shape was a `batchAccepted` flag, an `acceptedBatchId` that was assigned and
+     * never read, and two counters. It could not answer "is this file one I agreed to?", so once
+     * the flag was true any generic file was accepted. See [AcceptedBatch].
+     *
+     * Both of these and [inbound] are touched only from the single-threaded message handler and
+     * from user actions dispatched onto the same scope, so no lock is needed. `@Volatile` is kept
+     * on the pair that a UI thread reads for gating.
      */
     @Volatile
-    private var batchAccepted = false
+    private var accepted: AcceptedBatch? = null
 
-    private var acceptedBatchId: UUID? = null
-    private var expectedBatchFiles = 0
-    private var receivedBatchFiles = 0
+    /** An offer waiting on the user, with the deadline after which it expires locally. */
+    private var pendingOffer: PendingOffer? = null
+
+    private data class PendingOffer(
+        val batchId: UUID,
+        val entries: List<FileManifestEntry>,
+        val expiryJob: kotlinx.coroutines.Job?,
+    )
 
     /** Re-reads the received-files list from disk. Cheap: a directory listing. */
     fun refreshReceivedFiles() {
@@ -522,8 +572,15 @@ class ContentRouter(
     }
 
     private fun onBatchOffer(session: RelaySession, offer: FileBatchOffer) {
-        // Decided but unanswered, or a transfer already running: one at a time.
-        if (_incomingBatch.value != null || batchAccepted || inbound != null) {
+        // Undecided, accepted-and-running, or a transfer already open: one batch at a time.
+        if (pendingOffer != null || accepted != null || inbound != null) {
+            // Logged, because a silent BUSY is indistinguishable from a lost offer. Diagnosing the
+            // stuck state above meant reading the sender's log and inferring this side's answer.
+            diagnostics.warn(
+                "router",
+                "batch refused as busy (prompt=${pendingOffer != null} " +
+                    "accepted=${accepted != null} receiving=${inbound != null})",
+            )
             session.trySend(FileBatchReject(UUID.randomUUID(), offer.batchId, ProtocolErrorCode.BUSY))
             return
         }
@@ -540,77 +597,101 @@ class ContentRouter(
             return
         }
         val valid = verdicts.filterIsInstance<FileTransferPolicy.MetadataVerdict.Valid>()
-        when (val verdict = FileTransferPolicy.validateBatch(valid)) {
-            is FileTransferPolicy.BatchVerdict.Invalid -> {
-                diagnostics.info("router", "batch refused: ${verdict.reason}")
-                session.trySend(
-                    FileBatchReject(UUID.randomUUID(), offer.batchId, ProtocolErrorCode.TOO_LARGE),
-                )
-                return
-            }
-            is FileTransferPolicy.BatchVerdict.Valid -> {
-                // Space for the whole batch plus headroom, checked before the user is asked, so
-                // an accept cannot be followed by a storage refusal half way through.
-                val needed = verdict.knownTotalBytes
-                if (cache.usableSpaceBytes() - ContentCache.STORAGE_HEADROOM_BYTES < needed) {
-                    session.trySend(
-                        FileBatchReject(
-                            UUID.randomUUID(),
-                            offer.batchId,
-                            ProtocolErrorCode.INSUFFICIENT_STORAGE,
-                        ),
-                    )
-                    _receiveState.value = ReceiveState.Failed("not enough space for those files")
-                    return
-                }
-                _incomingBatch.value = IncomingBatch(
+        val verdict = FileTransferPolicy.validateBatch(valid)
+        if (verdict is FileTransferPolicy.BatchVerdict.Invalid) {
+            diagnostics.info("router", "batch refused: ${verdict.reason}")
+            session.trySend(
+                FileBatchReject(UUID.randomUUID(), offer.batchId, ProtocolErrorCode.TOO_LARGE),
+            )
+            return
+        }
+        val total = (verdict as FileTransferPolicy.BatchVerdict.Valid).knownTotalBytes
+
+        // Space for the whole batch plus headroom, checked before the user is asked, so an accept
+        // cannot be followed by a storage refusal half way through. Subtraction, not addition, so
+        // a peer-supplied total cannot overflow the comparison.
+        if (cache.usableSpaceBytes() - ContentCache.STORAGE_HEADROOM_BYTES < total) {
+            session.trySend(
+                FileBatchReject(UUID.randomUUID(), offer.batchId, ProtocolErrorCode.INSUFFICIENT_STORAGE),
+            )
+            _receiveState.value = ReceiveState.Failed("not enough space for those files")
+            return
+        }
+
+        // The manifest is stored with the sender's transfer ids intact, because those ids are what
+        // consent is later matched against. The *displayed* values are the sanitised ones, so what
+        // the user sees is what would be written.
+        val entries = offer.files.mapIndexed { index, wire ->
+            wire.copy(
+                displayName = valid[index].safeName,
+                mimeType = valid[index].mimeType,
+            )
+        }
+
+        // Local expiry, independent of the controller. A lost cancellation, a controller that
+        // timed out silently, or one that was force-stopped must not leave a dialog on this phone
+        // that can never be answered and blocks every later batch as BUSY.
+        val expiry = scope.launch {
+            kotlinx.coroutines.delay(consentExpiryMs)
+            if (pendingOffer?.batchId == offer.batchId) {
+                diagnostics.info("router", "batch offer expired unanswered")
+                endBatch(
                     batchId = offer.batchId,
-                    senderName = FilenameSanitizer.sanitize(offer.senderName),
-                    files = valid.map {
-                        IncomingFile(
-                            displayName = it.safeName,
-                            mimeType = it.mimeType,
-                            sizeBytes = it.sizeBytes,
-                        )
-                    },
+                    outcome = "expired",
+                    notify = { s, id -> s.trySend(FileBatchCancel(UUID.randomUUID(), id, ProtocolErrorCode.TIMEOUT)) },
                 )
-                diagnostics.info("router", "batch offered: ${valid.size} files")
             }
         }
+
+        pendingOffer = PendingOffer(offer.batchId, entries, expiry)
+        _incomingBatch.value = IncomingBatch(
+            batchId = offer.batchId,
+            // The authenticated peer name from the handshake, never a name carried inside the
+            // offer. file-v1 displayed a `senderName` field the peer composed, which meant the
+            // identity shown in the consent dialog was peer-controlled. That field is gone.
+            senderName = session.outcome.peerDeviceName,
+            files = entries.map {
+                IncomingFile(displayName = it.displayName, mimeType = it.mimeType, sizeBytes = it.sizeBytes)
+            },
+        )
+        diagnostics.info("router", "batch offered: ${entries.size} files")
     }
 
     /**
      * A generic file finished arriving and was stored.
      *
-     * Also the point where batch consent expires: once every file the batch promised has landed,
-     * the acceptance is spent. Leaving it set would let a peer send a twenty-first file after a
-     * twenty-file batch without asking again.
+     * Marks the manifest entry received and, once nothing is left pending, ends the batch. Consent
+     * expiring is driven by the manifest rather than by a count of `SHOW_FILE` messages: a peer
+     * that simply stopped sending them used to leave consent alive indefinitely.
      */
     private fun onGenericFileStored(transferId: UUID) {
         if (completed[transferId] == null) return
-        receivedBatchFiles++
-        if (expectedBatchFiles in 1..receivedBatchFiles) {
-            diagnostics.info("router", "batch complete: $receivedBatchFiles files")
-            clearBatchAcceptance()
+        val batch = accepted
+        if (batch != null) {
+            batch.markReceived(transferId)
+            if (batch.settled) {
+                diagnostics.info("router", "batch finished: ${batch.receivedCount}/${batch.size} received")
+                endBatch(batch.batchId, outcome = "completed", notify = null)
+            }
         }
         refreshReceivedFiles()
     }
 
     /** The user accepted the whole batch. */
     fun acceptIncomingBatch() {
-        val pending = _incomingBatch.value ?: return
+        val pending = pendingOffer ?: return
         val session = engine.activeSession.value
         if (session == null) {
-            _incomingBatch.value = null
+            // Nothing to accept to. Clear the dialog rather than leaving it over a dead session.
+            endBatch(pending.batchId, outcome = "session gone", notify = null)
             return
         }
-        batchAccepted = true
-        acceptedBatchId = pending.batchId
-        expectedBatchFiles = pending.files.size
-        receivedBatchFiles = 0
+        pending.expiryJob?.cancel()
+        pendingOffer = null
         _incomingBatch.value = null
+        accepted = AcceptedBatch(pending.batchId, pending.entries, System.currentTimeMillis())
         session.trySend(FileBatchAccept(UUID.randomUUID(), pending.batchId))
-        diagnostics.info("router", "batch accepted: ${pending.files.size} files")
+        diagnostics.info("router", "batch accepted: ${pending.entries.size} files")
     }
 
     /**
@@ -621,20 +702,67 @@ class ContentRouter(
      * than one that defaults to "no".
      */
     fun rejectIncomingBatch() {
-        val pending = _incomingBatch.value ?: return
-        _incomingBatch.value = null
-        clearBatchAcceptance()
-        engine.activeSession.value?.trySend(
-            FileBatchReject(UUID.randomUUID(), pending.batchId, ProtocolErrorCode.PERMISSION_DENIED),
+        val pending = pendingOffer ?: return
+        endBatch(
+            batchId = pending.batchId,
+            outcome = "rejected by the user",
+            notify = { s, id ->
+                s.trySend(FileBatchReject(UUID.randomUUID(), id, ProtocolErrorCode.PERMISSION_DENIED))
+            },
         )
-        diagnostics.info("router", "batch rejected by the user")
     }
 
-    private fun clearBatchAcceptance() {
-        batchAccepted = false
-        acceptedBatchId = null
-        expectedBatchFiles = 0
-        receivedBatchFiles = 0
+    /** The controller says the batch is over. */
+    private fun onBatchCancel(cancel: FileBatchCancel) {
+        // Late or unknown cancellations are ignored rather than treated as errors: a cancel naming
+        // a batch that already ended is exactly what a crossing cancel looks like.
+        val known = pendingOffer?.batchId == cancel.batchId || accepted?.batchId == cancel.batchId
+        if (!known) {
+            diagnostics.debug("router", "cancel for an unknown batch ignored")
+            return
+        }
+        diagnostics.info("router", "batch cancelled by the sender (${cancel.errorCode})")
+        endBatch(cancel.batchId, outcome = "cancelled by the sender", notify = null)
+    }
+
+    /**
+     * The one terminal path for a batch on this side, and safe to call repeatedly.
+     *
+     * Everything that ends a batch goes through here -- accept-with-no-session, rejection, local
+     * expiry, a peer cancel, completion, and session teardown -- so there is a single place where
+     * consent is dropped, the dialog is cleared, the in-flight receiver is closed and its partial
+     * deleted, and the peer is told if it needs to be. Scattering that cleanup was how the old
+     * code left a `batchAccepted` flag set after a cancellation.
+     *
+     * Files already received and hash-verified are kept: those bytes passed every check and the
+     * user was told they arrived. Consent still expires, which is the part that matters.
+     */
+    private fun endBatch(
+        batchId: UUID,
+        outcome: String,
+        notify: ((RelaySession, UUID) -> Unit)?,
+    ) {
+        val wasPending = pendingOffer?.batchId == batchId
+        val wasAccepted = accepted?.batchId == batchId
+        if (!wasPending && !wasAccepted) return
+
+        pendingOffer?.takeIf { it.batchId == batchId }?.let {
+            it.expiryJob?.cancel()
+            pendingOffer = null
+        }
+        if (wasPending) _incomingBatch.value = null
+
+        accepted?.takeIf { it.batchId == batchId }?.let { batch ->
+            batch.cancelUnfinished()
+            accepted = null
+        }
+
+        // Any transfer still open belonged to this batch: the protocol runs one at a time. Closing
+        // it deletes the unverified partial.
+        if (inbound != null) abortInboundQuietly("batch $outcome")
+
+        notify?.let { send -> engine.activeSession.value?.let { send(it, batchId) } }
+        diagnostics.info("router", "batch ended: $outcome")
     }
 
     /**
@@ -657,9 +785,28 @@ class ContentRouter(
      * connection state and a second error banner would only add noise. Still deletes the partial:
      * [TransferReceiver.cancel] removes it, and an unverified partial is never worth keeping.
      */
+    /**
+     * Fails the accepted-manifest entry for the transfer being dropped, and ends the batch if that
+     * was the last one outstanding.
+     *
+     * The receiver's half of "every batch reaches a terminal state". A file can fail for reasons
+     * the sender never reports -- a lost link, a digest mismatch, a full disk -- so the receiver
+     * cannot depend on being told.
+     */
+    private fun failInboundEntry(reason: String) {
+        val batch = accepted ?: return
+        val transferId = inboundTransferId ?: batch.receivingTransferId ?: return
+        batch.markFailed(transferId)
+        if (batch.settled) {
+            diagnostics.info("router", "batch ended after a failed transfer: $reason")
+            endBatch(batch.batchId, outcome = "a transfer failed", notify = null)
+        }
+    }
+
     private fun abortInboundQuietly(reason: String) {
         if (inbound == null) return
         diagnostics.info("router", "inbound transfer dropped: $reason")
+        failInboundEntry(reason)
         inbound?.cancel()
         inbound = null
         inboundTransferId = null
@@ -667,6 +814,13 @@ class ContentRouter(
     }
 
     private fun abortInbound(reason: String) {
+        // Mark the manifest entry failed before dropping the receiver. Without this the entry
+        // stayed PENDING for ever, the batch never settled, consent never expired, and every
+        // later batch was refused as BUSY for the life of the session -- a permanent stuck state
+        // reachable by any single failed file, not just by a cancellation. Doing it here rather
+        // than relying on the sender's notification is what makes the receiver self-healing: it
+        // recovers even if that message is lost.
+        failInboundEntry(reason)
         inbound?.cancel()
         inbound = null
         inboundTransferId = null
@@ -683,6 +837,22 @@ class ContentRouter(
             // The user on the other phone answered a batch offer.
             is FileBatchAccept -> pendingBatchDecisions.remove(message.batchId)?.complete(true)
             is FileBatchReject -> pendingBatchDecisions.remove(message.batchId)?.complete(false)
+
+            // The *receiver* ended the batch: the user rejected it there, or its consent prompt
+            // expired unanswered. Without this the sender sat in its 120 s decision timeout with
+            // `batchJob` still active, so the next batch was refused with "a batch is already
+            // being sent" -- the same class of stuck state as the original cancellation bug, just
+            // in the other direction. Found by BatchLifecycleTest, not by inspection.
+            is FileBatchCancel -> {
+                pendingBatchDecisions.remove(message.batchId)?.complete(false)
+                if (outbound?.batchId == message.batchId) {
+                    diagnostics.info("router", "batch ended by the receiver (${message.errorCode})")
+                    outboundCancelled = true
+                    batchJob?.cancel()
+                    _fileBatch.value = _fileBatch.value?.cancelAll()
+                    outbound?.let { releaseOutbound(it) }
+                }
+            }
             is TransferCancel -> {
                 pendingAccepts.remove(message.transferId)?.complete(false)
                 outboundCancelled = true
@@ -853,6 +1023,9 @@ class ContentRouter(
         sizeBytes: Long,
         digest: ByteArray,
         transferId: UUID,
+        /** Set for a batched generic file; null for an image or PDF presentation transfer. */
+        batchId: UUID? = null,
+        manifestIndex: Int? = null,
         onProgress: (Long) -> Unit,
         onVerifying: () -> Unit,
     ): OneFileResult {
@@ -868,6 +1041,9 @@ class ContentRouter(
                     mimeType = source.mimeType,
                     displayName = source.displayName,
                     sha256 = digest,
+                    // Binds this file to the manifest the user approved. Absent for image and PDF.
+                    batchId = batchId,
+                    manifestIndex = manifestIndex,
                 ),
             )
             val ok = withTimeoutOrNull(OFFER_TIMEOUT_MS) { accepted.await() } ?: false
@@ -922,6 +1098,11 @@ class ContentRouter(
         } catch (e: CancellationException) {
             throw e
         } catch (e: IOException) {
+            // The exception class and message, never the filename or path: this is the only place
+            // that knows why a send failed, and "could not read the file" alone is not diagnosable.
+            if (!outboundCancelled) {
+                diagnostics.warn("router", "send failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
             session.trySend(TransferCancel(UUID.randomUUID(), transferId, ProtocolErrorCode.CANCELLED))
             return if (outboundCancelled) {
                 OneFileResult.Failed("cancelled", retryable = true)
@@ -1004,22 +1185,40 @@ class ContentRouter(
     /** The current multi-file send, or null when there is none. Observed by the send screen. */
     val fileBatch: StateFlow<FileBatchState?> = _fileBatch.asStateFlow()
 
-    /** The sources behind [_fileBatch], kept so a retry can re-read only the files that failed. */
+    /** The sources behind [_fileBatch], kept so a retry can re-prepare only the files that failed. */
     private var batchSources: List<ContentSource> = emptyList()
 
     @Volatile
     private var batchJob: kotlinx.coroutines.Job? = null
 
     /**
+     * Everything the batch in flight owns, so terminating it cannot miss a piece.
+     *
+     * Holding the batch id, the spool files and the transfer currently in flight together is what
+     * makes cancellation complete: the old code cancelled a coroutine and updated a StateFlow,
+     * which told the peer nothing and left spool files behind.
+     */
+    private class OutboundBatch(
+        val batchId: UUID,
+        val spoolFiles: MutableMap<Int, java.io.File> = mutableMapOf(),
+        @Volatile var activeTransferId: UUID? = null,
+    )
+
+    @Volatile
+    private var outbound: OutboundBatch? = null
+
+    /**
      * Offers a set of files to the peer and, if the user there accepts, sends them in order.
      *
      * Returns null when the send started, or the reason it could not. Refusing here rather than
-     * starting and failing is the point: a peer without `file-v1` would otherwise receive a
-     * FILE_BATCH_OFFER it cannot parse and drop the session over it.
+     * starting and failing is the point: a peer without `file-v2` would otherwise receive a
+     * FILE_BATCH_OFFER whose manifest it cannot parse.
      */
     fun sendFileBatch(sources: List<ContentSource>): FileTransferPolicy.SendRefusal? {
         val session = engine.activeSession.value ?: return FileTransferPolicy.SendRefusal.NotConnected
-        if (!session.outcome.peerCapabilities.contains(Capabilities.FILE_V1)) {
+        // file-v2 only. A peer announcing just file-v1 has the unbound-manifest protocol, which
+        // this build will not speak, so it is told to update rather than silently downgraded.
+        if (!session.outcome.peerCapabilities.contains(Capabilities.FILE_V2)) {
             return FileTransferPolicy.SendRefusal.PeerTooOld
         }
         if (batchJob?.isActive == true) {
@@ -1062,18 +1261,14 @@ class ContentRouter(
 
         val indices = current.retryableIndices
         outboundCancelled = false
-        // A fresh batch id: this is a new offer, and reusing the old one would make the peer's
-        // duplicate suppression treat it as a repeat of a decision already made.
+        // A fresh batch id: this is a new offer with a new manifest, and reusing the old id would
+        // collide with the receiver's record of a batch that already ended.
         val batchId = UUID.randomUUID()
         _fileBatch.value = current.copy(
             batchId = batchId,
             cancelled = false,
             files = current.files.mapIndexed { index, file ->
-                if (index in indices) {
-                    file.copy(phase = FilePhase.Waiting, bytesTransferred = 0)
-                } else {
-                    file
-                }
+                if (index in indices) file.copy(phase = FilePhase.Waiting, bytesTransferred = 0) else file
             },
         )
         batchJob = scope.launch { runBatch(session, batchId, indices) }
@@ -1081,20 +1276,23 @@ class ContentRouter(
     }
 
     /**
-     * Marks an interrupted batch failed when the session ends.
+     * Marks an interrupted outbound batch failed when the session ends.
      *
      * Retryable, and deliberately so: the link dropping is exactly the case a retry button is for.
      * Files the peer already verified stay complete -- a disconnect does not un-send what is
      * already written on the other phone -- and a retry re-offers only the unfinished ones, each
      * from its first byte, because the protocol has no resume.
      *
-     * Reconnecting needs no re-pairing: trust is stored per peer and survives the session, so the
-     * retry works as soon as the connection is back.
+     * Reconnecting needs no re-pairing: trust is stored per peer and survives the session, so a
+     * retry works as soon as the connection is back. No message is sent here: there is no session
+     * left to send it on, and the peer is running its own teardown for the same reason.
      */
-    private fun failBatchOnSessionEnd() {
+    private fun failOutboundBatchOnSessionEnd() {
+        outboundCancelled = true
         batchJob?.cancel()
         pendingBatchDecisions.values.forEach { it.complete(false) }
         pendingBatchDecisions.clear()
+        outbound?.let { releaseOutbound(it) }
         val current = _fileBatch.value ?: return
         if (current.settled) return
         _fileBatch.value = current.copy(
@@ -1108,21 +1306,76 @@ class ContentRouter(
         )
     }
 
-    /** Cancels the batch in flight. Files already verified by the peer stay sent. */
+    /**
+     * Cancels the batch in flight, and tells the peer.
+     *
+     * Order matters and is the whole fix. The old implementation called `batchJob?.cancel()` and
+     * stopped there: `streamOneFile` rethrows `CancellationException` before it can send anything,
+     * so the Display was never told. It kept its consent, its open partial and its
+     * "transfer running" state, and refused every later batch as BUSY until the session ended.
+     *
+     * So the notifications go out *first*, on the still-live session, and only then is the
+     * coroutine cancelled. `trySend` is used rather than the suspending send because this must not
+     * itself be cancellable.
+     */
     fun cancelFileBatch() {
         outboundCancelled = true
+        val batch = outbound
+        val session = engine.activeSession.value
+        if (batch != null && session != null) {
+            // Abort the individual transfer too, if one is mid-flight: the batch cancel ends the
+            // batch, but the receiver also has a TransferReceiver open on this specific transfer.
+            batch.activeTransferId?.let {
+                session.trySend(TransferCancel(UUID.randomUUID(), it, ProtocolErrorCode.CANCELLED))
+            }
+            session.trySend(
+                FileBatchCancel(UUID.randomUUID(), batch.batchId, ProtocolErrorCode.CANCELLED),
+            )
+        }
         batchJob?.cancel()
         _fileBatch.value = _fileBatch.value?.cancelAll()
+        batch?.let { releaseOutbound(it) }
     }
 
     fun clearFileBatch() {
         if (batchJob?.isActive == true) return
         _fileBatch.value = null
         batchSources = emptyList()
+        outbound?.let { releaseOutbound(it) }
     }
 
     /**
-     * The batch driver: prepare, offer, wait for the user on the other phone, then stream in order.
+     * Releases everything one outbound batch owned. Safe to call repeatedly.
+     *
+     * **Takes the batch rather than reading the current one, and that is the point.** Coroutine
+     * cancellation is not synchronous: `batchJob.cancel()` flips `isActive` to false at once but
+     * the coroutine's `finally` runs later. So a cancelled batch's cleanup could fire *after* the
+     * user had already started the next one, and an unscoped version -- which deleted whatever
+     * `outbound` happened to point at -- deleted the **new** batch's spool files. The next
+     * transfer then failed with `FileNotFoundException ... ENOENT` at stream time, intermittently,
+     * depending on how long the user took to accept.
+     *
+     * Found on hardware, by logging the exception that "could not read the file" was hiding.
+     *
+     * Deleting the spool copies here rather than at the end of `runBatch` is deliberate: the
+     * cancellation path never reaches the end of `runBatch`, and a spool file is a full copy of
+     * the user's document. Startup also sweeps the directory, for the case where the process died
+     * before this ran.
+     */
+    private fun releaseOutbound(batch: OutboundBatch) {
+        // Only detach the shared reference if this batch is still the live one. A late cleanup
+        // from a superseded batch must not disown its successor.
+        if (outbound === batch) outbound = null
+        batch.activeTransferId = null
+        val files = batch.spoolFiles.values.toList()
+        batch.spoolFiles.clear()
+        pendingBatchDecisions.remove(batch.batchId)?.complete(false)
+        if (files.isEmpty()) return
+        scope.launch(Dispatchers.IO) { files.forEach { cache.spool.delete(it) } }
+    }
+
+    /**
+     * The batch driver: spool, offer, wait for the user on the other phone, then stream in order.
      *
      * Strictly sequential. The protocol allows one bulk transfer at a time
      * ([ContentLimits.MAX_CONCURRENT_TRANSFERS]) and the receiver enforces it by rejecting a
@@ -1133,68 +1386,87 @@ class ContentRouter(
             _fileBatch.value = _fileBatch.value?.let(block)
         }
 
-        // 1. Measure and digest every file first, so the offer carries real sizes and the user on
-        //    the other phone is shown a total that will not change.
-        val prepared = LinkedHashMap<Int, PrepareResult.Ready>()
-        for (index in indices) {
-            if (outboundCancelled) return
-            val source = batchSources.getOrNull(index) ?: continue
-            when (val result = withContext(Dispatchers.IO) { source.prepare() }) {
-                is PrepareResult.Ready -> {
-                    prepared[index] = result
-                    // Replace the provider's guess with the measured length.
-                    update {
-                        it.copy(
-                            files = it.files.mapIndexed { i, f ->
-                                if (i == index) f.copy(declaredSize = result.sizeBytes) else f
-                            },
+        val batch = OutboundBatch(batchId)
+        outbound = batch
+        // NonCancellable so a cancellation part-way through cannot skip the peer notification and
+        // the spool cleanup. The body itself still observes `outboundCancelled` and the spooling
+        // pass still checks for cancellation, so this does not make the batch uninterruptible --
+        // it makes its *teardown* reliable.
+        try {
+            // 1. Spool every file first, so the manifest describes bytes that already exist and
+            //    the originals are never reopened. Transfer ids are allocated here, because the
+            //    manifest has to name them before consent is given.
+            val prepared = LinkedHashMap<Int, PreparedFile>()
+            for (index in indices) {
+                if (outboundCancelled) return
+                val source = batchSources.getOrNull(index) ?: continue
+                val transferId = UUID.randomUUID()
+                val target = cache.spool.fileFor(transferId)
+                update { it.withPhase(index, FilePhase.Sending).withProgress(index, 0) }
+
+                val result = withContext(Dispatchers.IO) {
+                    source.spoolTo(target) { copied -> update { it.withProgress(index, copied) } }
+                }
+                when (result) {
+                    is SpoolResult.Ready -> {
+                        batch.spoolFiles[index] = target
+                        prepared[index] = PreparedFile(transferId, target, result.sizeBytes, result.sha256)
+                        update {
+                            it.copy(
+                                files = it.files.mapIndexed { i, f ->
+                                    if (i == index) {
+                                        f.copy(declaredSize = result.sizeBytes, bytesTransferred = 0, phase = FilePhase.Waiting)
+                                    } else {
+                                        f
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    is SpoolResult.Failed -> update {
+                        it.withPhase(
+                            index,
+                            FilePhase.Failed(
+                                reason = when (result.error) {
+                                    ContentSourceError.TOO_LARGE -> "larger than the 50 MB limit"
+                                    else -> "could not be read"
+                                },
+                                // Not retryable: re-reading gives the same answer. The user needs
+                                // to pick a different file, and a retry that cannot work is worse
+                                // than no retry.
+                                retryable = false,
+                            ),
                         )
                     }
                 }
-                is PrepareResult.Failed -> update {
-                    it.withPhase(
-                        index,
-                        FilePhase.Failed(
-                            reason = when (result.error) {
-                                ContentSourceError.TOO_LARGE -> "larger than the 50 MB limit"
-                                else -> "could not be read"
-                            },
-                            // Not retryable: re-reading gives the same answer. The user needs to
-                            // pick a different file, and a retry button that cannot work is worse
-                            // than no button.
-                            retryable = false,
-                        ),
-                    )
-                }
             }
-        }
-        if (prepared.isEmpty()) {
-            diagnostics.info("router", "batch had no readable files")
-            return
-        }
+            if (prepared.isEmpty()) {
+                diagnostics.info("router", "batch had no readable files")
+                return
+            }
 
-        // 2. One confirmation for the whole selection.
-        val manifest = prepared.map { (index, ready) ->
-            val source = batchSources[index]
-            FileManifestEntry(
-                displayName = source.displayName,
-                mimeType = source.mimeType,
-                sizeBytes = ready.sizeBytes,
-            )
-        }
-        val decision = CompletableDeferred<Boolean>()
-        pendingBatchDecisions[batchId] = decision
-        try {
-            session.send(
-                FileBatchOffer(
-                    id = UUID.randomUUID(),
-                    batchId = batchId,
-                    senderName = localDeviceName(),
-                    files = manifest,
-                ),
-            )
+            // 2. One confirmation for the whole selection, bound to those exact files.
+            val manifest = prepared.entries.map { (index, file) ->
+                FileManifestEntry(
+                    transferId = file.transferId,
+                    displayName = batchSources[index].displayName,
+                    mimeType = batchSources[index].mimeType,
+                    sizeBytes = file.sizeBytes,
+                    sha256 = file.sha256,
+                )
+            }
+            val decision = CompletableDeferred<Boolean>()
+            pendingBatchDecisions[batchId] = decision
+            session.send(FileBatchOffer(UUID.randomUUID(), batchId, manifest))
             val accepted = withTimeoutOrNull(BATCH_DECISION_TIMEOUT_MS) { decision.await() } ?: false
+            pendingBatchDecisions.remove(batchId)
+
             if (!accepted) {
+                // Includes the timeout case. Telling the Display is what dismisses a dialog that
+                // is still on screen there; without it the prompt outlived the sender's patience.
+                session.trySend(
+                    FileBatchCancel(UUID.randomUUID(), batchId, ProtocolErrorCode.TIMEOUT),
+                )
                 update { state ->
                     state.copy(
                         files = state.files.mapIndexed { i, f ->
@@ -1202,70 +1474,97 @@ class ContentRouter(
                         },
                     )
                 }
-                diagnostics.info("router", "batch declined by the display")
+                diagnostics.info("router", "batch not accepted")
                 return
             }
+
+            update { state ->
+                state.copy(
+                    files = state.files.mapIndexed { i, f ->
+                        if (i in prepared.keys && !f.phase.terminal) f.copy(phase = FilePhase.Accepted) else f
+                    },
+                )
+            }
+
+            // 3. Stream them in order, from the spool, with the batch binding on every offer.
+            for ((position, entry) in prepared.entries.withIndex()) {
+                val index = entry.key
+                val file = entry.value
+                if (outboundCancelled) {
+                    update { it.cancelAll() }
+                    return
+                }
+                batch.activeTransferId = file.transferId
+                update { it.withPhase(index, FilePhase.Sending).withProgress(index, 0) }
+
+                val result = streamOneFile(
+                    session = session,
+                    source = SpooledContentSource(
+                        file = file.spool,
+                        mimeType = batchSources[index].mimeType,
+                        displayName = batchSources[index].displayName,
+                    ),
+                    sizeBytes = file.sizeBytes,
+                    digest = file.sha256,
+                    transferId = file.transferId,
+                    batchId = batchId,
+                    manifestIndex = position,
+                    onProgress = { sent -> update { it.withProgress(index, sent) } },
+                    onVerifying = { update { it.withPhase(index, FilePhase.Verifying) } },
+                )
+                batch.activeTransferId = null
+
+                when (result) {
+                    OneFileResult.Sent -> {
+                        session.send(
+                            ShowFile(UUID.randomUUID(), file.transferId, ContentKind.FILE, FitMode.DEFAULT),
+                        )
+                        update { it.withPhase(index, FilePhase.Complete).withProgress(index, file.sizeBytes) }
+                        // The spool copy has served its purpose the moment the peer verified it.
+                        batch.spoolFiles.remove(index)?.let { spent ->
+                            withContext(Dispatchers.IO) { cache.spool.delete(spent) }
+                        }
+                    }
+                    OneFileResult.RejectedByPeer -> update { it.withPhase(index, FilePhase.Rejected) }
+                    is OneFileResult.Failed -> {
+                        update { it.withPhase(index, FilePhase.Failed(result.reason, result.retryable)) }
+                        // A cancellation stops the batch; one unreadable file does not.
+                        if (outboundCancelled) {
+                            update { it.cancelAll() }
+                            return
+                        }
+                    }
+                }
+            }
+            val settled = _fileBatch.value
+            val delivered = prepared.keys.count { index ->
+                settled?.files?.getOrNull(index)?.phase == FilePhase.Complete
+            }
+            if (delivered < prepared.size) {
+                // Not every file the receiver approved arrived, so its manifest still has entries
+                // outstanding. Tell it the batch is over, or it would hold consent -- and refuse
+                // the next batch as BUSY -- until the session ended. The receiver also fails the
+                // entry itself, so this is belt and braces rather than the only mechanism.
+                diagnostics.info("router", "batch incomplete, telling the display it is over")
+                session.trySend(
+                    FileBatchCancel(UUID.randomUUID(), batchId, ProtocolErrorCode.CANCELLED),
+                )
+            }
+            diagnostics.info("router", "batch done: $delivered/${prepared.size} sent")
         } finally {
-            pendingBatchDecisions.remove(batchId)
+            // Runs on every path including cancellation, and releases *this* batch only -- see
+            // releaseOutbound for why naming the batch matters.
+            releaseOutbound(batch)
         }
-
-        update { state ->
-            state.copy(
-                files = state.files.mapIndexed { i, f ->
-                    if (i in prepared.keys && !f.phase.terminal) f.copy(phase = FilePhase.Accepted) else f
-                },
-            )
-        }
-
-        // 3. Stream them in order.
-        for ((index, ready) in prepared) {
-            if (outboundCancelled) {
-                update { it.cancelAll() }
-                return
-            }
-            val source = batchSources[index]
-            val transferId = UUID.randomUUID()
-            update { it.withPhase(index, FilePhase.Sending).withProgress(index, 0) }
-
-            val result = streamOneFile(
-                session = session,
-                source = source,
-                sizeBytes = ready.sizeBytes,
-                digest = ready.sha256,
-                transferId = transferId,
-                onProgress = { sent -> update { it.withProgress(index, sent) } },
-                onVerifying = { update { it.withPhase(index, FilePhase.Verifying) } },
-            )
-
-            when (result) {
-                OneFileResult.Sent -> {
-                    // Tells the Display to file it away. A generic file draws nothing on screen;
-                    // this is what moves it into the received-files list over there.
-                    session.send(
-                        ShowFile(UUID.randomUUID(), transferId, ContentKind.FILE, FitMode.DEFAULT),
-                    )
-                    update { it.withPhase(index, FilePhase.Complete).withProgress(index, ready.sizeBytes) }
-                }
-                OneFileResult.RejectedByPeer ->
-                    update { it.withPhase(index, FilePhase.Rejected) }
-                is OneFileResult.Failed -> {
-                    update {
-                        it.withPhase(index, FilePhase.Failed(result.reason, result.retryable))
-                    }
-                    // A cancellation stops the batch; one unreadable file does not.
-                    if (outboundCancelled) {
-                        update { it.cancelAll() }
-                        return
-                    }
-                }
-            }
-        }
-        val settled = _fileBatch.value
-        diagnostics.info(
-            "router",
-            "batch done: ${settled?.completedCount}/${settled?.total} sent",
-        )
     }
+
+    /** A file spooled and ready to send, with the digest of exactly those bytes. */
+    private class PreparedFile(
+        val transferId: UUID,
+        val spool: java.io.File,
+        val sizeBytes: Long,
+        val sha256: ByteArray,
+    )
 
     /** Waiters for the Display's decision on a batch, keyed by batch id. */
     private val pendingBatchDecisions = mutableMapOf<UUID, CompletableDeferred<Boolean>>()
