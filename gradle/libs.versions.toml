@@ -3,13 +3,13 @@ agp = "9.4.0"
 kotlin = "2.2.10"
 
 # AndroidX
-coreKtx = "1.19.0"
+coreKtx = "1.19.1"
 activityCompose = "1.13.0"
 lifecycle = "2.11.0"
 datastore = "1.2.1"
 exifinterface = "1.4.2"
 camerax = "1.6.2"
-composeBom = "2026.02.01"
+composeBom = "2026.09.00"
 
 # Third party
 zxing = "3.5.4"
